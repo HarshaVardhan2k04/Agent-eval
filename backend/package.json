@@ -1,0 +1,27 @@
+{
+  "name": "agent-eval-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "diff": "^7.0.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.1.0",
+    "nanoid": "^5.1.5",
+    "pg": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/diff": "^7.0.2",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.0",
+    "@types/pg": "^8.15.4",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  }
+}
