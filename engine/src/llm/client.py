@@ -93,6 +93,17 @@ class LLMClient:
         content = (raw.content or "").strip()
         content = content.replace("```json", "").replace("```", "").strip()
         match = re.search(r"\{.*\}", content, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        raise ValueError(f"Failed to parse JSON from LLM response: {content[:200]}")
+        if not match:
+            raise ValueError(f"Failed to parse JSON from LLM response: {content[:200]}")
+        blob = match.group(0)
+        try:
+            return json.loads(blob)
+        except json.JSONDecodeError:
+            # Small models (Gemma) intermittently emit a missing comma / trailing
+            # bracket, especially on long judge outputs. Repair rather than fail the
+            # whole call — same fallback the metrics use.
+            from json_repair import repair_json
+            repaired = repair_json(blob, return_objects=True)
+            if isinstance(repaired, (dict, list)) and repaired:
+                return repaired
+            raise

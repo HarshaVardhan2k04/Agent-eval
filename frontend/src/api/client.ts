@@ -144,6 +144,17 @@ export const api = {
     if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`)
     return res.json()
   },
+  // Import from calls — verticals (with db/gcs config flags) + fetch-and-score by call ID.
+  analysisVerticals(): Promise<{ key: string; label: string; dbConfigured: boolean; gcsConfigured: boolean }[]> {
+    return request('/api/analysis/verticals')
+  },
+  importAnalysisCalls(batchId: string, body: { vertical: string; call_ids: string[] }) {
+    return request(`/api/analysis/batches/${batchId}/import`, { method: 'POST', body: JSON.stringify(body) })
+  },
+  // Signed URL to play an imported call's recording (null for uploads/pastes).
+  callAudioUrl(callId: number | string) {
+    return request(`/api/analysis/calls/${callId}/audio-url`)
+  },
   listCallBatches() {
     return request('/api/analysis/batches')
   },
@@ -152,6 +163,9 @@ export const api = {
   },
   getCall(callId: number | string) {
     return request(`/api/analysis/calls/${callId}`)
+  },
+  renameCallBatch(id: string, name: string) {
+    return request(`/api/analysis/batches/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) })
   },
   deleteCallBatch(id: string) {
     return request(`/api/analysis/batches/${id}`, { method: 'DELETE' })

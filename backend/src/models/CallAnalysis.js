@@ -11,6 +11,12 @@ module.exports = (sequelize, DataTypes) =>
       },
       call_id: { type: DataTypes.TEXT, allowNull: true },
       source_filename: { type: DataTypes.TEXT, allowNull: true }, // audio file (recordings)
+      // 'upload' (recordings), 'paste' (transcripts), or 'import' (production call).
+      source_type: { type: DataTypes.TEXT, allowNull: false, defaultValue: 'upload' },
+      // Import provenance: which vertical + recording location in GCS (for playback).
+      vertical: { type: DataTypes.TEXT, allowNull: true },
+      gcs_path: { type: DataTypes.TEXT, allowNull: true },
+      gcs_bucket: { type: DataTypes.TEXT, allowNull: true },
       direction: { type: DataTypes.TEXT, allowNull: true },
       transcript: { type: DataTypes.TEXT, allowNull: true },
       sections_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },

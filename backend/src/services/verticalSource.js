@@ -86,16 +86,29 @@ function getBucket(key, bucketName) {
 
 // --- public API ------------------------------------------------------------
 
-// List verticals with a `configured` flag so the UI can enable/disable them.
+// List verticals with config flags so the UI can enable/disable them.
+//   configured    = fully usable (DB + GCS)  — needed for STT import (re-transcribes audio)
+//   dbConfigured  = transcript fetch works    — enough for Analyze Calls import
+//   gcsConfigured = recording download/playback works
 function listVerticals() {
   return VERTICALS.map((v) => {
     const { dbConfigured, gcsConfigured } = envFor(v.key);
-    return { key: v.key, label: v.label, configured: dbConfigured && gcsConfigured };
+    return {
+      key: v.key, label: v.label,
+      configured: dbConfigured && gcsConfigured,
+      dbConfigured, gcsConfigured,
+    };
   });
 }
 
 function isVertical(key) {
   return VERTICALS.some((v) => v.key === key);
+}
+
+// True when a vertical's Postgres creds are present (transcript fetch works even
+// without GCS — Analyze Calls only needs the transcript to score).
+function dbConfigured(key) {
+  return !!envFor(key).dbConfigured;
 }
 
 // Fetch call rows by id from a vertical's `calls` table (SELECT only).
@@ -139,5 +152,5 @@ async function signedUrl(key, gcsPath, gcsBucket, ttlMs = 15 * 60 * 1000) {
 }
 
 module.exports = {
-  listVerticals, isVertical, fetchCalls, downloadRecording, signedUrl, MAX_IDS,
+  listVerticals, isVertical, dbConfigured, fetchCalls, downloadRecording, signedUrl, MAX_IDS,
 };

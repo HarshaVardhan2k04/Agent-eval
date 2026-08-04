@@ -4,6 +4,7 @@ const { nanoid } = require('nanoid');
 const { CallBatch, CallAnalysis, Flow } = require('../models');
 const { scoreCall } = require('../services/analysisClient');
 const sttClient = require('../services/sttClient');
+const verticalSource = require('../services/verticalSource');
 
 const SECTION_KEYS = [
   'greeting_intro', 'empathy', 'information_push_goal',
@@ -288,6 +289,134 @@ async function addCalls(req, res) {
   }
 }
 
+// --- Import path ------------------------------------------------------------
+// Pull real calls from a vertical's production DB (read-only) and score their
+// stored transcripts against the batch's flow/tools/direction. The production
+// `transcript` is the actual conversation — we judge it directly (no re-STT);
+// `gcs_path` is kept so the call report can play the recording.
+async function scoreImportInBackground(batch, vertical, callIds) {
+  const CONCURRENCY = 3;
+
+  async function storeGated(row, reason) {
+    await CallAnalysis.create({
+      batch_id: batch.id,
+      call_id: row.id != null ? String(row.id) : null,
+      source_type: 'import',
+      vertical,
+      gcs_path: row.gcs_path || null,
+      gcs_bucket: row.gcs_bucket || null,
+      direction: batch.direction,
+      transcript: row.transcript || '',
+      gated_reason: reason,
+      composite_score: null,
+    });
+  }
+
+  let rows;
+  try {
+    rows = await verticalSource.fetchCalls(vertical, callIds);
+  } catch (e) {
+    // Unconfigured vertical / bad creds / DB down — gate every id so the UI shows why.
+    console.error('[analysis] import fetchCalls failed', batch.id, e.message);
+    const reason = `import_failed: ${e.message}`.slice(0, 200);
+    for (const id of callIds) { try { await storeGated({ id }, reason); } catch { /* keep going */ } }
+    await refreshSummary(batch.id, 'done').catch(() => {});
+    return;
+  }
+
+  let idx = 0;
+  async function worker() {
+    while (idx < rows.length) {
+      const row = rows[idx++];
+      try {
+        if (row._missing) { await storeGated(row, 'not_found'); continue; }
+        if (!row.transcript || !row.transcript.trim()) { await storeGated(row, 'no_transcript'); continue; }
+
+        const payload = {
+          call_id: String(row.id),
+          transcript: row.transcript,
+          call_direction: batch.direction,
+          editable_config: batch.editable_config || {},
+          available_tools: batch.tools_json || [],
+          tool_events: [],
+        };
+        let result;
+        try {
+          result = await scoreCall(payload);
+        } catch (e) {
+          result = { sections: {}, metrics: {}, flow_adherence: [], areas_of_improvement: [], composite_score: null, gated_reason: `error: ${e.message}`.slice(0, 200) };
+        }
+        await CallAnalysis.create({
+          batch_id: batch.id,
+          call_id: payload.call_id,
+          source_type: 'import',
+          vertical,
+          gcs_path: row.gcs_path || null,
+          gcs_bucket: row.gcs_bucket || null,
+          direction: payload.call_direction,
+          transcript: payload.transcript,
+          sections_json: result.sections || {},
+          metrics_json: result.metrics || {},
+          flow_json: result.flow_adherence || [],
+          areas_json: result.areas_of_improvement || [],
+          tool_events_json: [],
+          gated_reason: result.gated_reason || null,
+          composite_score: result.composite_score,
+        });
+        await refreshSummary(batch.id, 'scoring');
+      } catch (e) {
+        console.error('[analysis] failed to store imported call', batch.id, e.message);
+      }
+    }
+  }
+
+  try {
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, rows.length) }, worker));
+  } finally {
+    await refreshSummary(batch.id, 'done').catch(() => {});
+  }
+}
+
+async function importCalls(req, res) {
+  try {
+    const batch = await CallBatch.findByPk(req.params.id);
+    if (!batch) {
+      res.status(404).json({ error: 'Batch not found' });
+      return;
+    }
+    const { vertical, call_ids } = req.body;
+    if (!verticalSource.isVertical(vertical)) {
+      res.status(400).json({ error: `unknown vertical '${vertical}'` });
+      return;
+    }
+    // Analyze Calls only needs the transcript (DB); GCS is optional (playback only).
+    if (!verticalSource.dbConfigured(vertical)) {
+      res.status(400).json({ error: `vertical '${vertical}' has no database credentials — set its VERTICAL_${String(vertical).toUpperCase()}_DB_* keys in backend/.env` });
+      return;
+    }
+    if (!Array.isArray(call_ids) || call_ids.length === 0) {
+      res.status(400).json({ error: 'call_ids[] is required' });
+      return;
+    }
+    await CallBatch.update({ status: 'scoring' }, { where: { id: batch.id } });
+    scoreImportInBackground(batch.toJSON(), vertical, call_ids).catch((e) =>
+      console.error('[analysis] import scoring failed', batch.id, e.message)
+    );
+    res.json({ queued: call_ids.length, batch_id: batch.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Unknown error' });
+  }
+}
+
+// verticalSource.listVerticals() — each with a `configured` flag for the UI.
+function getVerticals(_req, res) {
+  try {
+    res.json(verticalSource.listVerticals());
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Unknown error' });
+  }
+}
+
 async function listBatches(_req, res) {
   try {
     const rows = await CallBatch.findAll({ order: [['created_at', 'DESC']] });
@@ -332,6 +461,44 @@ async function getCall(req, res) {
   }
 }
 
+// Short-lived signed URL to play an imported call's recording from GCS (null for
+// uploaded/pasted calls, whose audio we don't retain).
+async function getCallAudioUrl(req, res) {
+  try {
+    const row = await CallAnalysis.findByPk(parseInt(req.params.callId, 10));
+    if (!row) {
+      res.status(404).json({ error: 'Call not found' });
+      return;
+    }
+    if (row.source_type === 'import' && row.vertical && row.gcs_path) {
+      const url = await verticalSource.signedUrl(row.vertical, row.gcs_path, row.gcs_bucket);
+      res.json({ url });
+      return;
+    }
+    res.json({ url: null });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Unknown error' });
+  }
+}
+
+async function renameBatch(req, res) {
+  try {
+    const name = (req.body.name || '').trim();
+    if (!name) {
+      res.status(400).json({ error: 'name is required' });
+      return;
+    }
+    const [n] = await CallBatch.update({ name }, { where: { id: req.params.id } });
+    if (!n) {
+      res.status(404).json({ error: 'Batch not found' });
+      return;
+    }
+    res.json({ id: req.params.id, name });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Unknown error' });
+  }
+}
+
 async function deleteBatch(req, res) {
   try {
     await CallBatch.destroy({ where: { id: req.params.id } });
@@ -342,5 +509,6 @@ async function deleteBatch(req, res) {
 }
 
 module.exports = {
-  createBatch, addCalls, addRecordings, listBatches, getBatch, getCall, deleteBatch,
+  createBatch, addCalls, addRecordings, importCalls, getVerticals,
+  listBatches, getBatch, getCall, getCallAudioUrl, renameBatch, deleteBatch,
 };

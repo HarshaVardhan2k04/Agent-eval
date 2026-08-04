@@ -1,127 +1,117 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { T, card, label } from '../theme'
+import { T, card, btnPrimary } from '../theme'
 import { api } from '../api/client'
-import { usePersisted } from '../usePersisted'
-import { ScoreRing, MetricBar, SECTION_LABELS, METRIC_LABELS, score100Color } from '../components/analysis'
+import { score100Color } from '../components/analysis'
 
-type Batch = { id: string; name: string | null; direction: string; status: string; summary_json: any; created_at: string }
-type Analysis = { id: number; call_id: string | null; composite_score: number | null; gated_reason: string | null }
+type Batch = { id: string; name: string | null; direction: string; status: string; flow_name?: string | null; summary_json: any; created_at: string }
 
 export function ScoreboardPage() {
   const nav = useNavigate()
   const [batches, setBatches] = useState<Batch[]>([])
-  const [sel, setSel] = usePersisted<string>('scoreboard:sel', '')
-  const [detail, setDetail] = useState<(Batch & { analyses: Analysis[] }) | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [editing, setEditing] = useState<string | null>(null)
+  const [draftName, setDraftName] = useState('')
+  const [confirmDel, setConfirmDel] = useState<string | null>(null)
+  const editRef = useRef<HTMLInputElement>(null)
 
-  useEffect(() => {
-    api.listCallBatches().then((bs) => {
-      setBatches(bs)
-      // Keep the previously-selected batch if it still exists; else default to newest.
-      if (bs.length && !bs.some((b: Batch) => b.id === sel)) setSel(bs[0].id)
-    }).catch(() => {})
-  }, [])
+  const load = () => api.listCallBatches().then((bs) => setBatches(bs)).catch(() => {}).finally(() => setLoading(false))
+  useEffect(() => { load() }, [])
+  useEffect(() => { if (editing) editRef.current?.focus() }, [editing])
 
-  useEffect(() => {
-    if (sel) api.getCallBatch(sel).then(setDetail).catch(() => {})
-  }, [sel])
-
-  if (!batches.length) {
-    return (
-      <div>
-        <h1 style={{ fontSize: 27, fontWeight: 650, margin: 0, color: T.text }}>Scoreboard</h1>
-        <p style={{ fontSize: 14.5, color: T.muted, margin: '7px 0 0' }}>The metrics board across a batch of calls.</p>
-        <div style={{ ...card, padding: 44, marginTop: 24, textAlign: 'center', color: T.faint }}>
-          No batches yet — analyze some calls first.
-        </div>
-      </div>
-    )
+  const startRename = (b: Batch) => { setEditing(b.id); setDraftName(b.name || '') }
+  const saveRename = async (id: string) => {
+    const name = draftName.trim()
+    setEditing(null)
+    if (!name) return
+    setBatches((bs) => bs.map((b) => (b.id === id ? { ...b, name } : b)))
+    try { await api.renameCallBatch(id, name) } catch { load() }
+  }
+  const doDelete = async (id: string) => {
+    setConfirmDel(null)
+    setBatches((bs) => bs.filter((b) => b.id !== id))
+    try { await api.deleteCallBatch(id) } catch { load() }
   }
 
-  const s = detail?.summary_json || {}
-  const worst = (detail?.analyses || [])
-    .filter((a) => a.composite_score != null)
-    .sort((a, b) => (a.composite_score! - b.composite_score!))
-    .slice(0, 6)
+  const fmtDate = (s: string) => { try { return new Date(s).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) } catch { return '' } }
 
   return (
     <div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
-        <div>
-          <h1 style={{ fontSize: 27, fontWeight: 650, margin: 0, color: T.text }}>Scoreboard</h1>
-          <p style={{ fontSize: 14.5, color: T.muted, margin: '7px 0 0' }}>How the agent performs across a batch — and where it fails most.</p>
-        </div>
-        <select value={sel} onChange={(e) => setSel(e.target.value)}
-          style={{ marginLeft: 'auto', padding: '10px 13px', borderRadius: T.rInput, background: T.surface2, border: `1px solid ${T.border2}`, color: T.text, fontSize: 13.5, outline: 'none' }}>
-          {batches.map((b) => <option key={b.id} value={b.id}>{b.name || b.id} ({b.summary_json?.n_scored ?? 0})</option>)}
-        </select>
-      </div>
+      <h1 style={{ fontSize: 27, fontWeight: 650, margin: 0, color: T.text }}>Scoreboard</h1>
+      <p style={{ fontSize: 14.5, color: T.muted, margin: '7px 0 0' }}>Every test run you've analyzed. Open one to see its full metrics.</p>
 
-      {/* Top metric tiles */}
-      <div style={{ display: 'flex', gap: 12, marginTop: 22, flexWrap: 'wrap' }}>
-        <div style={{ ...card, padding: 20, display: 'flex', alignItems: 'center', gap: 14, minWidth: 210 }}>
-          <ScoreRing value={s.composite_mean ?? null} size={64} />
-          <div>
-            <div style={label}>Composite</div>
-            <div style={{ fontSize: 12.5, color: T.muted, marginTop: 3 }}>{s.n_scored ?? 0} scored · {s.n_gated ?? 0} skipped</div>
+      {loading ? (
+        <div style={{ color: T.faint, fontSize: 13, marginTop: 24 }}>Loading…</div>
+      ) : batches.length === 0 ? (
+        <div style={{ marginTop: 24, border: `1px dashed ${T.border2}`, borderRadius: 18, padding: '68px 24px', textAlign: 'center' }}>
+          <div style={{ width: 56, height: 56, margin: '0 auto 22px', borderRadius: 15, background: T.accentSoft, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="4" y="12.5" width="3.4" height="7.5" rx="1.3" fill="var(--accent-hi)" />
+              <rect x="10.3" y="7" width="3.4" height="13" rx="1.3" fill="var(--accent-hi)" />
+              <rect x="16.6" y="10" width="3.4" height="10" rx="1.3" fill="var(--accent-hi)" />
+            </svg>
           </div>
-        </div>
-        <div style={{ flex: 1, minWidth: 280, display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 10 }}>
-          {Object.keys(METRIC_LABELS).map((k) => <MetricBar key={k} name={k} value={s.metric_means?.[k] ?? null} />)}
-        </div>
-      </div>
-
-      {/* Section averages */}
-      <div style={{ ...label, margin: '26px 0 12px' }}>Section averages</div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(230px,1fr))', gap: 10 }}>
-        {Object.keys(SECTION_LABELS).map((k) => {
-          const v = s.section_means?.[k] ?? null
-          return (
-            <div key={k} style={{ ...card, padding: '14px 16px' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                <span style={{ fontSize: 12.5, color: T.text2 }}>{SECTION_LABELS[k]}</span>
-                <span style={{ fontSize: 15, fontWeight: 700, fontFamily: T.mono, color: score100Color(v) }}>{v ?? '—'}</span>
-              </div>
-              <div style={{ height: 6, borderRadius: 99, background: T.track, overflow: 'hidden' }}>
-                <div style={{ height: '100%', width: `${v ?? 0}%`, background: score100Color(v), borderRadius: 99 }} />
-              </div>
-            </div>
-          )
-        })}
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginTop: 26 }} className="hist-grid">
-        {/* Worst calls */}
-        <div>
-          <div style={{ ...label, marginBottom: 12 }}>Needs attention · lowest scores</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {worst.map((a) => (
-              <div key={a.id} className="ev-row" onClick={() => nav(`/analyze/${sel}/call/${a.id}`)}
-                style={{ ...card, padding: '11px 14px', display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' }}>
-                <span style={{ fontSize: 16, fontWeight: 700, fontFamily: T.mono, color: score100Color(a.composite_score), width: 42 }}>{a.composite_score}</span>
-                <span style={{ flex: 1, minWidth: 0, fontSize: 12.5, fontFamily: T.mono, color: T.text3, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{a.call_id || `#${a.id}`}</span>
-              </div>
-            ))}
-            {worst.length === 0 && <div style={{ color: T.faint, fontSize: 13 }}>No scored calls.</div>}
+          <div style={{ fontSize: 21, fontWeight: 650, color: T.text }}>No calls analyzed yet</div>
+          <div style={{ fontSize: 14, color: T.muted, margin: '10px auto 0', maxWidth: 430, lineHeight: 1.55 }}>
+            Upload a batch of real transcripts and this board fills in — averages, weak spots, and the calls worth listening to again.
           </div>
+          <button onClick={() => nav('/analyze')} style={{ ...btnPrimary, marginTop: 24 }}>Analyze your first batch</button>
         </div>
-
-        {/* Top improvement themes */}
-        <div>
-          <div style={{ ...label, marginBottom: 12 }}>Recurring improvement themes</div>
-          <div style={{ ...card, padding: 16 }}>
-            {(s.top_themes || []).length === 0 && <div style={{ color: T.faint, fontSize: 13 }}>Nothing recurring yet.</div>}
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {(s.top_themes || []).map((t: { text: string; count: number }, i: number) => (
-                <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
-                  <span style={{ fontSize: 11, fontFamily: T.mono, color: 'var(--accent)', background: T.accentSoft, borderRadius: 6, padding: '2px 7px', flexShrink: 0 }}>×{t.count}</span>
-                  <span style={{ fontSize: 13, color: T.text2, lineHeight: 1.5 }}>{t.text}</span>
+      ) : (
+        <div style={{ ...card, overflow: 'hidden', marginTop: 22 }}>
+          {/* header */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 90px 90px 150px 84px', gap: 12, padding: '11px 18px', borderBottom: `1px solid ${T.divider}`, fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.04em', color: T.muted }}>
+            <span>Test run</span><span>Flow</span><span>Calls</span><span>Composite</span><span>When</span><span></span>
+          </div>
+          {batches.map((b) => {
+            const comp = b.summary_json?.composite_mean ?? null
+            const n = b.summary_json?.n_scored ?? 0
+            const scoring = b.status === 'scoring'
+            return (
+              <div key={b.id} className="ev-row"
+                style={{ display: 'grid', gridTemplateColumns: '1fr 130px 90px 90px 150px 84px', gap: 12, padding: '13px 18px', borderBottom: `1px solid ${T.divider}`, alignItems: 'center', cursor: editing === b.id ? 'default' : 'pointer' }}
+                onClick={() => { if (editing !== b.id && !confirmDel) nav(`/scoreboard/${b.id}`) }}>
+                {/* name (rename inline) */}
+                <div style={{ minWidth: 0 }} onClick={(e) => e.stopPropagation()}>
+                  {editing === b.id ? (
+                    <input ref={editRef} value={draftName} onChange={(e) => setDraftName(e.target.value)}
+                      onBlur={() => saveRename(b.id)} onKeyDown={(e) => { if (e.key === 'Enter') saveRename(b.id); if (e.key === 'Escape') setEditing(null) }}
+                      style={{ width: '100%', padding: '6px 9px', borderRadius: 8, background: T.well, border: `1px solid var(--accent)`, color: T.text, fontSize: 13.5, outline: 'none' }} />
+                  ) : (
+                    <div onClick={() => nav(`/scoreboard/${b.id}`)} style={{ fontSize: 13.5, fontWeight: 600, color: T.text, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {b.name || b.id}
+                      {scoring && <span style={{ marginLeft: 8, fontSize: 11, color: T.blue }}>· scoring…</span>}
+                    </div>
+                  )}
                 </div>
-              ))}
-            </div>
-          </div>
+                <span style={{ fontSize: 12.5, color: T.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{b.flow_name || b.direction}</span>
+                <span style={{ fontSize: 13, fontFamily: T.mono, color: T.text3 }}>{n}</span>
+                <span style={{ fontSize: 15, fontWeight: 700, fontFamily: T.mono, color: score100Color(comp) }}>{comp ?? '—'}</span>
+                <span style={{ fontSize: 12, color: T.faint }}>{fmtDate(b.created_at)}</span>
+                {/* actions */}
+                <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }} onClick={(e) => e.stopPropagation()}>
+                  {confirmDel === b.id ? (
+                    <>
+                      <button onClick={() => doDelete(b.id)} title="Confirm delete" style={iconBtn(T.red)}>✓</button>
+                      <button onClick={() => setConfirmDel(null)} title="Cancel" style={iconBtn(T.faint)}>✕</button>
+                    </>
+                  ) : (
+                    <>
+                      <button onClick={() => startRename(b)} title="Rename" style={iconBtn(T.muted)}>✎</button>
+                      <button onClick={() => setConfirmDel(b.id)} title="Delete" style={iconBtn(T.muted)}>🗑</button>
+                    </>
+                  )}
+                </div>
+              </div>
+            )
+          })}
         </div>
-      </div>
+      )}
     </div>
   )
 }
+
+const iconBtn = (color: string): React.CSSProperties => ({
+  width: 30, height: 30, borderRadius: 8, border: `1px solid ${T.border2}`, background: T.surface2,
+  color, fontSize: 13, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+})

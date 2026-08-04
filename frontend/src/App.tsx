@@ -12,6 +12,7 @@ import { AnalyzeCallsPage } from './pages/AnalyzeCallsPage'
 import { CallBatchPage } from './pages/CallBatchPage'
 import { CallReportPage } from './pages/CallReportPage'
 import { ScoreboardPage } from './pages/ScoreboardPage'
+import { ScoreboardDetailPage } from './pages/ScoreboardDetailPage'
 import { FlowBuilderPage } from './pages/FlowBuilderPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { LlmPage } from './pages/LlmPage'
@@ -34,6 +35,7 @@ function App() {
           <Route path="/analyze/:batchId" element={<CallBatchPage />} />
           <Route path="/analyze/:batchId/call/:callId" element={<CallReportPage />} />
           <Route path="/scoreboard" element={<ScoreboardPage />} />
+          <Route path="/scoreboard/:id" element={<ScoreboardDetailPage />} />
 
           {/* Test STT (P2) */}
           <Route path="/stt" element={<SttPage />} />

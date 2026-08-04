@@ -19,8 +19,24 @@ const DIRECTIONS: [string, string, string][] = [
 // a module-level cache that survives in-app navigation but not a full reload
 // (browsers won't let JS re-hydrate a File without the user re-picking it).
 const DRAFT_KEY = 'analyze-calls-draft'
-type Draft = { direction: string; flowId: string; tools: string[]; showPaste: boolean; pasteText: string }
+type Draft = {
+  direction: string; flowId: string; tools: string[]; showPaste: boolean; pasteText: string
+  source: 'upload' | 'import'; vertical: string; callIdsText: string
+}
 let fileCache: File[] = []
+
+type Vertical = { key: string; label: string; dbConfigured: boolean; gcsConfigured: boolean }
+
+// Parse a paste of call IDs: JSON array, or newline/comma/space separated.
+function parseIds(text: string): string[] {
+  const t = text.trim()
+  if (!t) return []
+  try {
+    const j = JSON.parse(t)
+    if (Array.isArray(j)) return j.map((x) => String(x).trim()).filter(Boolean)
+  } catch { /* not JSON — fall through */ }
+  return t.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean)
+}
 
 function loadDraft(): Partial<Draft> {
   try { return JSON.parse(sessionStorage.getItem(DRAFT_KEY) || '{}') } catch { return {} }
@@ -61,12 +77,18 @@ export function AnalyzeCallsPage() {
   const [error, setError] = useState<string | null>(null)
   const [showPaste, setShowPaste] = useState(d0.showPaste || false)
   const [pasteText, setPasteText] = useState(d0.pasteText || '')
+  const [source, setSource] = useState<'upload' | 'import'>(d0.source || 'upload')
+  const [verticals, setVerticals] = useState<Vertical[]>([])
+  const [vertical, setVertical] = useState(d0.vertical || '')
+  const [callIdsText, setCallIdsText] = useState(d0.callIdsText || '')
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => { api.listFlows().then(setFlows).catch(() => {}) }, [])
+  useEffect(() => { api.analysisVerticals().then(setVerticals).catch(() => {}) }, [])
   // Persist the form so it survives navigation / refresh (see DRAFT_KEY above).
   useEffect(() => { fileCache = files }, [files])
-  useEffect(() => { saveDraft({ direction, flowId, tools, showPaste, pasteText }) }, [direction, flowId, tools, showPaste, pasteText])
+  useEffect(() => { saveDraft({ direction, flowId, tools, showPaste, pasteText, source, vertical, callIdsText }) },
+    [direction, flowId, tools, showPaste, pasteText, source, vertical, callIdsText])
 
   const selectedFlow = flows.find((f) => f.id === flowId)
   const stages = useMemo(
@@ -74,9 +96,12 @@ export function AnalyzeCallsPage() {
     [selectedFlow]
   )
   const pasted = useMemo(() => parseCalls(pasteText), [pasteText])
+  const callIds = useMemo(() => parseIds(callIdsText), [callIdsText])
   const recordingCount = files.length
   const usingPaste = showPaste && !!pasted
-  const canAnalyze = (recordingCount > 0 || usingPaste) && !!flowId
+  const importReady = source === 'import' && !!vertical && callIds.length > 0
+  const uploadReady = source === 'upload' && (recordingCount > 0 || usingPaste)
+  const canAnalyze = (importReady || uploadReady) && !!flowId
 
   const addFiles = (fl: FileList | null) => {
     if (!fl) return
@@ -92,7 +117,9 @@ export function AnalyzeCallsPage() {
     try {
       const batchName = selectedFlow ? `${selectedFlow.name} · ${direction}` : `${direction} calls`
       const batch = await api.createCallBatch({ name: batchName, direction, flow_id: flowId, tools })
-      if (usingPaste && pasted) {
+      if (source === 'import') {
+        await api.importAnalysisCalls(batch.id, { vertical, call_ids: callIds })
+      } else if (usingPaste && pasted) {
         await api.addCalls(batch.id, pasted)
       } else {
         const form = new FormData()
@@ -127,7 +154,55 @@ export function AnalyzeCallsPage() {
       <div className="an-grid" style={{ display: 'grid', gridTemplateColumns: '1fr 330px', gap: 18, alignItems: 'start' }}>
         {/* LEFT */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          {/* 1. Recordings */}
+          {/* 0. Where the calls come from */}
+          <div style={{ display: 'inline-flex', gap: 4, padding: 4, background: T.well, borderRadius: 12, border: `1px solid ${T.border}`, width: 'fit-content' }}>
+            {([['upload', 'Upload recordings'], ['import', 'Import from calls']] as const).map(([v, lbl]) => {
+              const on = source === v
+              return (
+                <button key={v} onClick={() => setSource(v)}
+                  style={{ padding: '8px 16px', borderRadius: 9, border: 'none', cursor: 'pointer', fontSize: 13.5, fontWeight: on ? 600 : 500, background: on ? T.surface2 : 'transparent', color: on ? T.text : T.muted }}>
+                  {lbl}
+                </button>
+              )
+            })}
+          </div>
+
+          {/* 1a. Import from production calls */}
+          {source === 'import' && (
+            <div style={{ ...card, overflow: 'hidden' }}>
+              {cardHead('Import from calls', 'pull real calls from a production DB — we score their transcripts',
+                <div style={{ fontSize: 12, fontFamily: T.mono, color: callIds.length ? T.green : T.faint, padding: '5px 10px', borderRadius: 99, background: callIds.length ? 'rgba(76,201,138,0.12)' : T.well, border: `1px solid ${T.border}` }}>
+                  {callIds.length ? `${callIds.length} ids` : 'no ids'}
+                </div>)}
+              <div style={{ padding: '16px 20px 18px' }}>
+                <div style={{ ...label, fontSize: 11, marginBottom: 9 }}>Which vertical?</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {verticals.map((v) => {
+                    const on = v.key === vertical
+                    const disabled = !v.dbConfigured
+                    return (
+                      <button key={v.key} disabled={disabled} onClick={() => setVertical(v.key)}
+                        title={disabled ? 'Database credentials not set for this vertical' : undefined}
+                        style={{ padding: '9px 14px', borderRadius: 11, fontSize: 13, cursor: disabled ? 'not-allowed' : 'pointer', background: on ? T.accentSoft : T.well, border: `1px solid ${on ? 'var(--accent)' : T.border2}`, color: disabled ? T.faint : (on ? T.text : T.text2), opacity: disabled ? 0.6 : 1 }}>
+                        {v.label}{disabled ? ' · creds not set' : ''}
+                      </button>
+                    )
+                  })}
+                  {verticals.length === 0 && <div style={{ fontSize: 13, color: T.faint }}>No verticals available.</div>}
+                </div>
+                <div style={{ ...label, fontSize: 11, margin: '16px 0 9px' }}>Call IDs</div>
+                <textarea value={callIdsText} onChange={(e) => setCallIdsText(e.target.value)} rows={5}
+                  placeholder={'Paste call IDs — JSON array, or one per line / comma-separated\ne.g. a13411d2-ee3f-46ed-90ee-a94a6f8b6636'}
+                  style={{ ...inputStyle, fontFamily: T.mono, fontSize: 12.5, lineHeight: 1.5, resize: 'vertical' }} />
+                <div style={{ fontSize: 11.5, color: callIds.length ? T.green : T.faint, marginTop: 6, fontFamily: T.mono }}>
+                  {callIds.length ? `${callIds.length} call id${callIds.length === 1 ? '' : 's'} parsed` : 'we fetch each call’s transcript from the DB and judge it against your flow'}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 1. Recordings (upload mode) */}
+          {source === 'upload' && (
           <div style={{ ...card, overflow: 'hidden' }}>
             {cardHead('Call recordings', 'mp3 or wav — we run them through speech-to-text for you',
               <div style={{ fontSize: 12, fontFamily: T.mono, color: recordingCount ? T.green : T.faint, padding: '5px 10px', borderRadius: 99, background: recordingCount ? 'rgba(76,201,138,0.12)' : T.well, border: `1px solid ${T.border}` }}>
@@ -181,6 +256,7 @@ export function AnalyzeCallsPage() {
               )}
             </div>
           </div>
+          )}
 
           {/* 2. Flow */}
           <div style={{ ...card, overflow: 'hidden' }}>
@@ -264,7 +340,9 @@ export function AnalyzeCallsPage() {
             <div style={{ ...label }}>Ready to analyze?</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 11, margin: '15px 0' }}>
               {[
-                [recordingCount > 0 || usingPaste, usingPaste ? `${pasted?.length} transcripts` : recordingCount ? `${recordingCount} recordings` : 'Add recordings'],
+                source === 'import'
+                  ? [importReady, vertical ? `${callIds.length} ids · ${verticals.find((v) => v.key === vertical)?.label || vertical}` : 'Pick a vertical + paste call IDs']
+                  : [recordingCount > 0 || usingPaste, usingPaste ? `${pasted?.length} transcripts` : recordingCount ? `${recordingCount} recordings` : 'Add recordings'],
                 [!!flowId, flowId ? `Flow: ${selectedFlow?.name}` : 'Pick a flow'],
                 [tools.length > 0, `${tools.length} tools selected`],
               ].map(([ok, txt], i) => (
@@ -276,11 +354,13 @@ export function AnalyzeCallsPage() {
             </div>
             <button onClick={analyze} disabled={!canAnalyze || busy}
               style={{ ...btnPrimary, width: '100%', opacity: (!canAnalyze || busy) ? 0.5 : 1, cursor: (!canAnalyze || busy) ? 'default' : 'pointer' }}>
-              {busy ? 'Starting…' : `Analyze ${usingPaste ? pasted?.length : recordingCount || ''} →`}
+              {busy ? 'Starting…' : `Analyze ${source === 'import' ? (callIds.length || '') : usingPaste ? pasted?.length : recordingCount || ''} →`}
             </button>
             {error && <div style={{ color: T.red, fontSize: 12.5, marginTop: 11 }}>{error}</div>}
             <div style={{ fontSize: 11.5, color: T.faint, lineHeight: 1.5, marginTop: 11 }}>
-              Recordings are transcribed then scored. You can leave the page — it keeps going in the background.
+              {source === 'import'
+                ? 'We fetch each call’s transcript from the DB and judge it against your flow. Results land in the Scoreboard.'
+                : 'Recordings are transcribed then scored. You can leave the page — it keeps going in the background.'}
             </div>
           </div>
         </div>
