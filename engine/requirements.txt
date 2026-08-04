@@ -3,3 +3,8 @@ uvicorn>=0.34.0
 openai>=1.82.0
 httpx>=0.28.0
 pydantic>=2.11.0
+python-dotenv>=1.0.0
+# STT layer
+websockets>=13.0        # Soniox realtime WS transport
+jiwer>=3.0.0            # WER/CER scoring
+json-repair>=0.30.0

@@ -61,7 +61,8 @@ class LLMClient:
             "skip_special_tokens": False,
         }
 
-    async def chat(self, messages, tools=None, temperature=0.3, max_tokens=300, enable_thinking=False):
+    async def chat(self, messages, tools=None, temperature=0.3, max_tokens=300,
+                   enable_thinking=False, seed=None, json_mode=False):
         async with self._global_semaphore:
             kwargs = {
                 "model": self.model,
@@ -72,15 +73,22 @@ class LLMClient:
             }
             if tools:
                 kwargs["tools"] = tools
+            if seed is not None:  # reproducible judge outputs (vLLM supports it)
+                kwargs["seed"] = seed
+            if json_mode:  # force valid JSON at the model layer (vLLM json_object)
+                kwargs["response_format"] = {"type": "json_object"}
             response = await self._client.chat.completions.create(**kwargs)
             msg = response.choices[0].message
             if msg.content:
                 msg.content = strip_thinking_leaks(msg.content)
             return msg
 
-    async def chat_json(self, messages, temperature=0.1, max_tokens=500, enable_thinking=False):
+    async def chat_json(self, messages, temperature=0.1, max_tokens=500,
+                        enable_thinking=False, seed=None, json_mode=True):
+        # json_mode defaults ON — judge/metric calls should always get valid JSON.
         raw = await self.chat(
-            messages, temperature=temperature, max_tokens=max_tokens, enable_thinking=enable_thinking
+            messages, temperature=temperature, max_tokens=max_tokens,
+            enable_thinking=enable_thinking, seed=seed, json_mode=json_mode,
         )
         content = (raw.content or "").strip()
         content = content.replace("```json", "").replace("```", "").strip()

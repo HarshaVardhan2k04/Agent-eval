@@ -31,3 +31,27 @@ test_data/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Scratch screenshots / pasted images at the repo root
+/image.png
+/image.*
+/screenshot*.png
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Tooling caches / build info
+*.tsbuildinfo
+.cache/
+coverage/
+*.tmp
+*.bak
+
+# Vendored reference (DeepEval) — not part of this project
+deepeval/
+
+# Vendored reference (Opik) — not part of this project
+opik/

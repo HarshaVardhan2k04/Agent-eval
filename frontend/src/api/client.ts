@@ -61,6 +61,159 @@ export const api = {
     })
   },
 
+  // --- Test STT ---
+  sttProviders() {
+    return request('/api/stt/providers')
+  },
+  // Verticals (production call sources) available for "Import from calls".
+  sttVerticals() {
+    return request('/api/stt/verticals')
+  },
+  createSttBatch(body: { name?: string; language: string; provider?: string; mode?: 'single' | 'batch' | 'import' | 'noise'; vertical?: string }) {
+    return request('/api/stt/batches', { method: 'POST', body: JSON.stringify(body) })
+  },
+  listSttBatches() {
+    return request('/api/stt/batches')
+  },
+  getSttBatch(id: string) {
+    return request(`/api/stt/batches/${id}`)
+  },
+  deleteSttBatch(id: string) {
+    return request(`/api/stt/batches/${id}`, { method: 'DELETE' })
+  },
+  // Multipart — must NOT set a JSON content-type (browser sets the boundary).
+  async addSttResult(batchId: string, form: FormData) {
+    const res = await fetch(`${BASE_URL}/api/stt/batches/${batchId}/results`, {
+      method: 'POST',
+      body: form,
+    })
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`)
+    return res.json()
+  },
+  // Batch upload — many audio files in one FormData (each appended as `audio`),
+  // plus an optional `references` field = JSON { filename: refText }. Multipart,
+  // so no JSON content-type. Returns { queued } immediately; poll getSttBatch.
+  async addSttUploads(batchId: string, form: FormData) {
+    const res = await fetch(`${BASE_URL}/api/stt/batches/${batchId}/uploads`, {
+      method: 'POST',
+      body: form,
+    })
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`)
+    return res.json()
+  },
+  // Import from calls — fetch recordings/transcripts for a vertical's call IDs,
+  // re-transcribe + score. Returns { queued } immediately; poll getSttBatch.
+  importSttCalls(batchId: string, body: { vertical: string; call_ids: string[] }) {
+    return request(`/api/stt/batches/${batchId}/import`, { method: 'POST', body: JSON.stringify(body) })
+  },
+  // Signed URL for a result's source audio ({ url } — null for uploads).
+  sttResultAudioUrl(resultId: number | string) {
+    return request(`/api/stt/results/${resultId}/audio-url`)
+  },
+  // Add-noise mode: available noise presets + intensity levels.
+  sttNoises(): Promise<{ noises: { key: string; label: string; filename: string }[]; levels: string[] }> {
+    return request('/api/stt/noises')
+  },
+  // Add-noise mode — one `recording` file + zero+ custom `noise` files, plus
+  // text fields `reference`, `level`, `noise_presets` (JSON array of keys).
+  // Multipart, so no JSON content-type. Returns { queued }; poll getSttBatch.
+  async runNoiseTest(batchId: string, form: FormData) {
+    const res = await fetch(`${BASE_URL}/api/stt/batches/${batchId}/noise-test`, {
+      method: 'POST',
+      body: form,
+    })
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`)
+    return res.json()
+  },
+  // Direct URL to a noise row's merged (noisy) WAV, for use as an <audio src>.
+  // 404s for the clean baseline row (which has no mixed audio).
+  sttResultMixedAudioUrl(resultId: number | string): string {
+    return `${BASE_URL}/api/stt/results/${resultId}/mixed-audio`
+  },
+
+  // --- Call Analysis ---
+  createCallBatch(body: { name?: string; direction?: string; flow_id?: string; editable_config?: unknown; tools?: string[] }) {
+    return request('/api/analysis/batches', { method: 'POST', body: JSON.stringify(body) })
+  },
+  addCalls(batchId: string, calls: unknown[]) {
+    return request(`/api/analysis/batches/${batchId}/calls`, { method: 'POST', body: JSON.stringify({ calls }) })
+  },
+  // Multipart — upload call recordings (audio); the backend transcribes + scores them.
+  async addRecordings(batchId: string, form: FormData) {
+    const res = await fetch(`${BASE_URL}/api/analysis/batches/${batchId}/recordings`, { method: 'POST', body: form })
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`)
+    return res.json()
+  },
+  listCallBatches() {
+    return request('/api/analysis/batches')
+  },
+  getCallBatch(id: string) {
+    return request(`/api/analysis/batches/${id}`)
+  },
+  getCall(callId: number | string) {
+    return request(`/api/analysis/calls/${callId}`)
+  },
+  deleteCallBatch(id: string) {
+    return request(`/api/analysis/batches/${id}`, { method: 'DELETE' })
+  },
+
+  // --- Flow Builder ---
+  generateFlow(body: { text: string; notes?: string; direction?: string }) {
+    return request('/api/flow/generate', { method: 'POST', body: JSON.stringify(body) })
+  },
+  editFlow(graph: unknown, instruction: string) {
+    return request('/api/flow/edit', { method: 'POST', body: JSON.stringify({ graph, instruction }) })
+  },
+  saveFlow(body: { name: string; direction?: string; definition: unknown }) {
+    return request('/api/flow/flows', { method: 'POST', body: JSON.stringify(body) })
+  },
+  listFlows() {
+    return request('/api/flow/flows')
+  },
+  getFlow(id: string) {
+    return request(`/api/flow/flows/${id}`)
+  },
+  updateFlow(id: string, body: { name?: string; direction?: string; definition?: unknown }) {
+    return request(`/api/flow/flows/${id}`, { method: 'PUT', body: JSON.stringify(body) })
+  },
+  deleteFlow(id: string) {
+    return request(`/api/flow/flows/${id}`, { method: 'DELETE' })
+  },
+
+  // --- Settings / Test-an-LLM ---
+  getSettings() {
+    return request('/api/settings')
+  },
+  setSetting(key: string, value: unknown) {
+    return request(`/api/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) })
+  },
+  llmInfo() {
+    return request('/api/settings/llm/info')
+  },
+  llmTest(body: { prompt: string; system?: string; base_url?: string; model?: string; enable_thinking?: boolean; max_tokens?: number }) {
+    return request('/api/settings/llm/test', { method: 'POST', body: JSON.stringify(body) })
+  },
+
+  // --- RAG Testing ---
+  ragDefaultUrl() {
+    return request('/api/rag/default-url')
+  },
+  ragCollections(url: string) {
+    return request(`/api/rag/collections?url=${encodeURIComponent(url)}`)
+  },
+  ragEvaluate(body: Record<string, unknown>) {
+    return request('/api/rag/evaluate', { method: 'POST', body: JSON.stringify(body) })
+  },
+  listRagTests() {
+    return request('/api/rag/tests')
+  },
+  getRagTest(id: string) {
+    return request(`/api/rag/tests/${id}`)
+  },
+  deleteRagTest(id: string) {
+    return request(`/api/rag/tests/${id}`, { method: 'DELETE' })
+  },
+
   subscribeToEvents(id: string, onEvent: (event: Record<string, unknown>) => void) {
     const source = new EventSource(`${BASE_URL}/api/evals/${id}/events`)
     source.onmessage = (e) => {

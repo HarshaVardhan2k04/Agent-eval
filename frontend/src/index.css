@@ -107,7 +107,7 @@ a, [role=button] { transition: transform .16s ease, border-color .18s ease, back
 }
 
 @media (max-width: 860px) {
-  .editors-grid, .config-grid, .prog-grid, .cards-3, .dims-grid, .hist-grid, .diff-grid, .voice-cards {
+  .editors-grid, .an-grid, .config-grid, .prog-grid, .cards-3, .dims-grid, .hist-grid, .diff-grid, .voice-cards {
     grid-template-columns: 1fr !important;
   }
   .voice-cards { grid-template-columns: 1fr 1fr !important; }
