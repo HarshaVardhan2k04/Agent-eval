@@ -228,6 +228,104 @@ export const api = {
     return request(`/api/rag/tests/${id}`, { method: 'DELETE' })
   },
 
+  // --- Forge (promptforge optimizer) ---
+  createForgeRun(body: Record<string, unknown>) {
+    return request('/api/forge/runs', { method: 'POST', body: JSON.stringify(body) })
+  },
+  listForgeRuns() {
+    return request('/api/forge/runs')
+  },
+  getForgeRun(id: string) {
+    return request(`/api/forge/runs/${id}`)
+  },
+  renameForgeRun(id: string, name: string) {
+    return request(`/api/forge/runs/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) })
+  },
+  deleteForgeRun(id: string) {
+    return request(`/api/forge/runs/${id}`, { method: 'DELETE' })
+  },
+  stopForgeRun(id: string) {
+    return request(`/api/forge/runs/${id}/stop`, { method: 'POST' })
+  },
+  // forge_events cursor feed — the progress page's live source (id > after).
+  getForgeLog(id: string, after: number) {
+    return request(`/api/forge/runs/${id}/log?after=${after}`)
+  },
+  // Per-run problem×version grid: [{version, status, statuses_json}]
+  getForgeMatrix(id: string) {
+    return request(`/api/forge/runs/${id}/matrix`)
+  },
+  answerForgeEscalation(id: string, escId: number | string, answer: string) {
+    return request(`/api/forge/runs/${id}/escalations/${escId}/answer`, { method: 'POST', body: JSON.stringify({ answer }) })
+  },
+  getForgeReview(id: string) {
+    return request(`/api/forge/runs/${id}/review`)
+  },
+  saveForgeReview(id: string, patch: Record<string, unknown>) {
+    return request(`/api/forge/runs/${id}/review`, { method: 'POST', body: JSON.stringify(patch) })
+  },
+  forgeChat(id: string, body: Record<string, unknown>) {
+    return request(`/api/forge/runs/${id}/chat`, { method: 'POST', body: JSON.stringify(body) })
+  },
+  forgeEvaluate(id: string) {
+    return request(`/api/forge/runs/${id}/evaluate`, { method: 'POST' })
+  },
+  exportForgeRun(id: string) {
+    return request(`/api/forge/runs/${id}/export`, { method: 'POST', body: JSON.stringify({}) })
+  },
+  // Global problem catalog (definitions; filter_territory is human-only)
+  listForgeProblems() {
+    return request('/api/forge/problems')
+  },
+  createForgeProblem(body: Record<string, unknown>) {
+    return request('/api/forge/problems', { method: 'POST', body: JSON.stringify(body) })
+  },
+  patchForgeProblem(id: string, patch: Record<string, unknown>) {
+    return request(`/api/forge/problems/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })
+  },
+  // Layer library — READ-ONLY list from agent_db_dev.prompts (same Postgres)
+  listForgeLayers(type: string): Promise<{ configured: boolean; db_name: string; rows: { id: string; prompt_type: string; friendly_name: string }[]; error?: string }> {
+    return request(`/api/forge/layers?type=${encodeURIComponent(type)}`)
+  },
+  getForgeLayer(id: string) {
+    return request(`/api/forge/layers/${id}`)
+  },
+  // LLM Arena — compare N hosted LLMs (own prompt each) on one dataset, judge fixed.
+  createForgeArena(body: Record<string, unknown>) {
+    return request('/api/forge/arenas', { method: 'POST', body: JSON.stringify(body) })
+  },
+  testArenaLlm(body: { base_url: string; api_key?: string; model: string; params?: Record<string, unknown> }): Promise<{ ok: boolean; reply?: string; error?: string; ms?: number }> {
+    return request('/api/forge/arenas/test-llm', { method: 'POST', body: JSON.stringify(body) })
+  },
+  // Simulation archive (run-then-grade proof)
+  listForgeSims(runId: string, filters?: Record<string, string | number>) {
+    const q = filters ? '?' + new URLSearchParams(Object.entries(filters).map(([k, v]) => [k, String(v)])).toString() : ''
+    return request(`/api/forge/runs/${runId}/sims${q}`)
+  },
+  getForgeSim(uid: string) {
+    return request(`/api/forge/sims/${uid}`)
+  },
+  listForgeArenas() {
+    return request('/api/forge/arenas')
+  },
+  getForgeArena(id: string) {
+    return request(`/api/forge/arenas/${id}`)
+  },
+  deleteForgeArena(id: string) {
+    return request(`/api/forge/arenas/${id}`, { method: 'DELETE' })
+  },
+  // Dataset library — every dataset ever given is stored; Setup offers select-or-paste.
+  listForgeDatasets(): Promise<{ id: string; name: string; kind: string; n: number; created_at: string }[]> {
+    return request('/api/forge/datasets')
+  },
+  getForgeDataset(id: string) {
+    return request(`/api/forge/datasets/${id}`)
+  },
+  // Production-faithful merged preview (markdown + greeting + sliced stage)
+  forgeMergePreview(body: Record<string, unknown>) {
+    return request('/api/forge/merge-preview', { method: 'POST', body: JSON.stringify(body) })
+  },
+
   subscribeToEvents(id: string, onEvent: (event: Record<string, unknown>) => void) {
     const source = new EventSource(`${BASE_URL}/api/evals/${id}/events`)
     source.onmessage = (e) => {

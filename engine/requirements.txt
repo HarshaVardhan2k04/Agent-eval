@@ -8,3 +8,4 @@ python-dotenv>=1.0.0
 websockets>=13.0        # Soniox realtime WS transport
 jiwer>=3.0.0            # WER/CER scoring
 json-repair>=0.30.0
+python-dateutil

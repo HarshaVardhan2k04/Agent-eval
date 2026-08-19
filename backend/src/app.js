@@ -13,6 +13,8 @@ const analysisRouter = require('./routes/analysis');
 const flowRouter = require('./routes/flow');
 const settingsRouter = require('./routes/settings');
 const ragRouter = require('./routes/rag');
+const forgeRouter = require('./routes/forge');
+const forgeController = require('./controllers/forgeController');
 
 const app = express();
 
@@ -30,5 +32,7 @@ app.use('/api/analysis', analysisRouter);
 app.use('/api/flow', flowRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/rag', ragRouter);
+app.use('/api/forge', forgeRouter);
+app.post('/api/internal/forge-events', forgeController.ingestForgeEvent); // engine progress callback
 
 module.exports = app;

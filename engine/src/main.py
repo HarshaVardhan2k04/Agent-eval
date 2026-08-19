@@ -7,6 +7,7 @@ from src.api.analysis_routes import router as analysis_router
 from src.api.flow_routes import router as flow_router
 from src.api.llm_routes import router as llm_router
 from src.api.metrics_routes import router as metrics_router
+from src.api.forge_routes import router as forge_router
 
 app = FastAPI(title="Agent Eval Engine", version="1.0.0")
 
@@ -23,6 +24,7 @@ app.include_router(analysis_router)
 app.include_router(flow_router)
 app.include_router(llm_router)
 app.include_router(metrics_router)
+app.include_router(forge_router)
 
 
 @app.get("/health")

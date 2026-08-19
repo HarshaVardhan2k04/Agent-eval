@@ -3,7 +3,7 @@ import { T } from '../theme'
 import { Sidebar } from './Sidebar'
 
 // Routes that want the full content width (canvas-style pages), not the centered column.
-const WIDE_ROUTES = ['/flow']
+const WIDE_ROUTES = ['/flow', '/forge']
 
 // App layout: persistent left sidebar + scrollable main content.
 export function AppShell() {

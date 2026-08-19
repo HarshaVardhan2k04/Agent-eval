@@ -4,7 +4,7 @@ import { T } from '../theme'
 import { ThemePicker } from './ThemePicker'
 import {
   IconHistory, IconPlus, IconAnalyze, IconBoard, IconStt, IconFlow,
-  IconTools, IconJudge, IconChevron, IconRag,
+  IconTools, IconJudge, IconChevron, IconRag, IconSwords,
 } from './icons'
 
 type Item = { to: string; label: string; icon: (p: { s?: number }) => ReactNode; end?: boolean }
@@ -12,7 +12,16 @@ type Group = { heading: string; items: Item[] }
 
 const GROUPS: Group[] = [
   {
-    heading: 'Prompt Eval',
+    heading: 'Forge',
+    items: [
+      { to: '/forge', label: 'Runs', icon: IconJudge, end: true },
+      { to: '/forge/new', label: 'New Run', icon: IconPlus },
+      { to: '/forge/matrix', label: 'Problem Matrix', icon: IconBoard },
+      { to: '/forge/arena', label: 'LLM Arena', icon: IconSwords },
+    ],
+  },
+  {
+    heading: 'Old Eval',
     items: [
       { to: '/', label: 'History', icon: IconHistory, end: true },
       { to: '/new', label: 'New Eval', icon: IconPlus },

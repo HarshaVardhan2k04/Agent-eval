@@ -16,13 +16,35 @@ import { ScoreboardDetailPage } from './pages/ScoreboardDetailPage'
 import { FlowBuilderPage } from './pages/FlowBuilderPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { LlmPage } from './pages/LlmPage'
+import { ForgeListPage } from './pages/forge/ForgeListPage'
+import { ForgeSetupPage } from './pages/forge/ForgeSetupPage'
+import { ForgeProgressPage } from './pages/forge/ForgeProgressPage'
+import { ForgeResultsPage } from './pages/forge/ForgeResultsPage'
+import { ForgeMatrixPage } from './pages/forge/ForgeMatrixPage'
+import { ForgeVersionsPage } from './pages/forge/ForgeVersionsPage'
+import { ForgeHumanReviewPage } from './pages/forge/ForgeHumanReviewPage'
+import { ForgeArenaPage } from './pages/forge/ForgeArenaPage'
+import { ForgeSimsPage } from './pages/forge/ForgeSimsPage'
 
 function App() {
   return (
     <BrowserRouter>
       <Routes>
         <Route element={<AppShell />}>
-          {/* Prompt Eval */}
+          {/* Forge (promptforge optimizer — supersedes Prompt Eval) */}
+          <Route path="/forge" element={<ForgeListPage />} />
+          <Route path="/forge/new" element={<ForgeSetupPage />} />
+          <Route path="/forge/matrix" element={<ForgeMatrixPage />} />
+          <Route path="/forge/arena" element={<ForgeArenaPage />} />
+          <Route path="/forge/arena/:id" element={<ForgeArenaPage />} />
+          <Route path="/forge/:id/progress" element={<ForgeProgressPage />} />
+          <Route path="/forge/:id/results" element={<ForgeResultsPage />} />
+          <Route path="/forge/:id/matrix" element={<ForgeMatrixPage />} />
+          <Route path="/forge/:id/sims" element={<ForgeSimsPage />} />
+          <Route path="/forge/:id/versions" element={<ForgeVersionsPage />} />
+          <Route path="/forge/:id/review" element={<ForgeHumanReviewPage />} />
+
+          {/* Old Eval (legacy Prompt Eval — read-only path) */}
           <Route path="/" element={<EvalListPage />} />
           <Route path="/new" element={<EvalSetupPage />} />
           <Route path="/eval/:id/progress" element={<EvalProgressPage />} />

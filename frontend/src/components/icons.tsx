@@ -60,3 +60,17 @@ export const IconSpinner = ({ s, style }: P) => (
     <path d="M12 3a9 9 0 1 0 9 9" />
   </svg>
 )
+// Dual crossed swords — anime FIGHT! energy (LLM Arena)
+export const IconSwords = ({ s, style }: P) => (
+  <svg viewBox="0 0 24 24" style={{ ...base(s), ...style }} {...svg}>
+    {/* blades crossing in an X */}
+    <path d="M3.5 4.5 14.5 15.5" /><path d="M20.5 4.5 9.5 15.5" />
+    {/* crossguards */}
+    <path d="M12.9 17.1 17.1 12.9" /><path d="M6.9 12.9 11.1 17.1" />
+    {/* grips + pommels */}
+    <path d="M16 16l2.7 2.7" /><path d="M8 16l-2.7 2.7" />
+    <path d="M19.4 19.4h.01" /><path d="M4.6 19.4h.01" />
+    {/* impact spark burst */}
+    <path d="M12 3.6V1.9" /><path d="m9.2 4.4-.9-1.4" /><path d="m14.8 4.4.9-1.4" />
+  </svg>
+)

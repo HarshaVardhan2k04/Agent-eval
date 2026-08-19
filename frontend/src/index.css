@@ -131,3 +131,4 @@ a, [role=button] { transition: transform .16s ease, border-color .18s ease, back
   .nav-links { display: none !important; }
   .dims-grid, .voice-cards { grid-template-columns: 1fr !important; }
 }
+.live-pulse { animation: pulse-dot 1.4s ease-in-out infinite; }

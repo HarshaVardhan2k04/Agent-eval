@@ -71,6 +71,30 @@ export function statusMeta(status: string): { color: string; label: string } {
   }
 }
 
+/** Forge run status → { color, label } (additive — legacy pages keep statusMeta). */
+export function forgeStatusMeta(status: string): { color: string; label: string } {
+  switch (status) {
+    case 'queued': return { color: T.faint, label: 'Queued' }
+    case 'collecting': return { color: T.blue, label: 'Collecting' }
+    case 'optimizing': return { color: T.blue, label: 'Optimizing' }
+    case 'awaiting_human': return { color: T.purple, label: 'Awaiting human' }
+    case 'llm_complete': return { color: T.amber, label: 'LLM-complete' }
+    case 'human_review': return { color: T.purple, label: 'Human review' }
+    case 'finalized': return { color: T.green, label: 'Finalized' }
+    case 'converged_below_gate': return { color: T.amber2, label: 'Converged < gate' }
+    case 'stopped': return { color: T.faint, label: 'Stopped' }
+    case 'failed': return { color: T.red, label: 'Failed' }
+    default: return { color: T.faint, label: status }
+  }
+}
+
+/** Problem verdict tokens for the matrix + progress deltas. */
+export const verdictMeta: Record<string, { color: string; label: string }> = {
+  Y: { color: T.green, label: 'Solved' },
+  N: { color: T.red, label: 'Failing' },
+  '~': { color: T.amber, label: 'Partial' },
+}
+
 // Reusable style fragments
 export const card: React.CSSProperties = {
   background: T.surface,
