@@ -132,3 +132,20 @@ a, [role=button] { transition: transform .16s ease, border-color .18s ease, back
   .dims-grid, .voice-cards { grid-template-columns: 1fr !important; }
 }
 .live-pulse { animation: pulse-dot 1.4s ease-in-out infinite; }
+/* ? hint tooltips — instant, styled, no native-title flakiness */
+/* the WRAP must sit above later siblings (inputs paint after it in DOM order),
+   so the z-index belongs here — isolate/z-index on the box alone gets trapped. */
+.hint-wrap { position: relative; display: inline-flex; }
+.hint-wrap:hover { z-index: 9999; }
+.hint-wrap .hint-box {
+  visibility: hidden; opacity: 0; transition: opacity .1s ease;
+  /* ABOVE the badge — the hint rows sit near the page bottom, so opening downward
+     ran off-screen. Opaque background + wrap z-index keep it readable over cards. */
+  position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+  width: 260px; padding: 10px 12px; border-radius: 9px; z-index: 9999;
+  background: #14110e; border: 1px solid rgba(245,235,220,0.18);
+  color: #e6ddcf; font-size: 11.5px; line-height: 1.55; font-weight: 400;
+  letter-spacing: normal; text-transform: none; white-space: normal;
+  box-shadow: 0 10px 30px #000a; pointer-events: none;
+}
+.hint-wrap:hover .hint-box { visibility: visible; opacity: 1; }

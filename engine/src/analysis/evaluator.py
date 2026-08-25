@@ -91,7 +91,7 @@ class CallEvaluator:
                     # Greedy (temp 0) + fixed seed -> reproducible scores. Sampling
                     # (temp>0) isn't deterministic under vLLM continuous batching even
                     # with a seed, so the judge decodes greedily like the metrics do.
-                    temperature=0.0,
+                    temperature=DEFAULT_JUDGE_TEMPERATURE,
                     max_tokens=DEFAULT_JUDGE_MAX_TOKENS,
                     enable_thinking=True,
                     json_mode=False,

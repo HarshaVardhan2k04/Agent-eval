@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { T, card, backBtn } from '../../theme'
 import { api } from '../../api/client'
-import { SimTranscript, type SimRow } from '../../components/forge'
+import { SimTranscript, ToolCallsStrip, type SimRow } from '../../components/forge'
 import { useForgeStore } from '../../stores/forgeStore'
 
 // The full conversation archive of a run — literally everything both LLMs said,
@@ -10,7 +10,7 @@ import { useForgeStore } from '../../stores/forgeStore'
 export function ForgeSimsPage() {
   const nav = useNavigate()
   const { id } = useParams<{ id: string }>()
-  const { problems, fetchProblems } = useForgeStore()
+  const { problems, fetchProblems, currentRun, fetchRun } = useForgeStore()
   const [sp] = useSearchParams()
   const [sims, setSims] = useState<SimRow[]>([])
   const [kind, setKind] = useState(sp.get('kind') || '')
@@ -20,7 +20,8 @@ export function ForgeSimsPage() {
   const [full, setFull] = useState<Record<string, SimRow>>({})
   const [loading, setLoading] = useState(true)
 
-  useEffect(() => { fetchProblems() }, [fetchProblems])
+  useEffect(() => { fetchProblems(); if (id) fetchRun(id) }, [fetchProblems, fetchRun, id])
+  const runLive = currentRun && currentRun.id === id && ['optimizing', 'collecting'].includes(currentRun.status)
   useEffect(() => {
     if (!id) return
     setLoading(true)
@@ -39,10 +40,15 @@ export function ForgeSimsPage() {
 
   const behaviourOf = (p: string | null) => (p && problems.find((x) => x.id === p)?.behaviour) || ''
   const pids = useMemo(() => Array.from(new Set(sims.map((s) => s.problem_id).filter(Boolean))) as string[], [sims])
+  // a tool check's verdict lives in check_verdict ('called' = pass), a problem
+  // sim's in verdict — fold both so the header counts every conversation.
+  const passed = (s: SimRow) => s.verdict === 'pass' || s.check_verdict === 'called'
+  const failed = (s: SimRow) => s.verdict === 'fail'
+    || (s.check_verdict != null && s.check_verdict !== 'called')
   const counts = useMemo(() => ({
     total: sims.length,
-    fail: sims.filter((s) => s.verdict === 'fail').length,
-    pass: sims.filter((s) => s.verdict === 'pass').length,
+    fail: sims.filter(failed).length,
+    pass: sims.filter(passed).length,
   }), [sims])
 
   const sel: React.CSSProperties = {
@@ -52,7 +58,9 @@ export function ForgeSimsPage() {
 
   return (
     <div>
-      <button onClick={() => nav(`/forge/${id}/results`)} style={backBtn}>← Back to results</button>
+      <button onClick={() => nav(runLive ? `/forge/${id}/progress` : `/forge/${id}/results`)} style={backBtn}>
+        {runLive ? '← Back to progress' : '← Back to results'}
+      </button>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
         <h1 style={{ fontSize: 24, fontWeight: 650, margin: 0, color: T.text }}>Simulations</h1>
         <span style={{ fontSize: 13, color: T.muted }}>
@@ -65,6 +73,7 @@ export function ForgeSimsPage() {
         <select value={kind} onChange={(e) => setKind(e.target.value)} style={sel}>
           <option value="">all kinds</option>
           <option value="dataset">dataset conversations</option>
+          <option value="toolcheck">tool checks</option>
           <option value="detector">problem checks</option>
           <option value="deep_confirm">deep-confirm</option>
           <option value="stress">stress sims</option>
@@ -91,21 +100,32 @@ export function ForgeSimsPage() {
           <div key={s.sim_uid}>
             <div className="ev-row" onClick={() => toggle(s.sim_uid)}
               style={{ display: 'grid', gridTemplateColumns: '40px 110px 60px 1fr 56px minmax(160px,0.6fr)', gap: 10, alignItems: 'center', padding: '7px 14px', cursor: 'pointer', background: openUid === s.sim_uid ? T.chip : i % 2 ? T.well : 'transparent', borderTop: `1px solid ${T.divider}` }}>
-              <span style={{ fontSize: 12.5, fontWeight: 800, color: s.verdict === 'fail' ? T.red : s.verdict === 'pass' ? T.green : T.fainter, textAlign: 'center' }}>
-                {s.verdict === 'fail' ? '✕' : s.verdict === 'pass' ? '✓' : '·'}
+              <span style={{ fontSize: 12.5, fontWeight: 800, color: failed(s) ? T.red : passed(s) ? T.green : T.fainter, textAlign: 'center' }}>
+                {failed(s) ? '✕' : passed(s) ? '✓' : '·'}
               </span>
               <span style={{ fontSize: 11.5, color: T.muted }}>{s.kind === 'deep_confirm' ? 'deep-confirm' : s.kind}</span>
               <span style={{ fontFamily: T.mono, fontSize: 11.5, color: T.faint }}>{s.problem_id || `#${(s.idx ?? 0) + 1}`}</span>
               <span style={{ fontSize: 12.5, color: T.text3, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {s.problem_id ? behaviourOf(s.problem_id) : s.probe || '—'}
               </span>
-              <span style={{ fontFamily: T.mono, fontSize: 11.5, color: T.fainter }}>{s.n_turns ?? '—'}</span>
-              <span style={{ fontSize: 11.5, color: s.verdict === 'fail' ? T.red : T.fainter, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.reason || ''}</span>
+              <span style={{ fontFamily: T.mono, fontSize: 11.5, color: T.fainter }}>
+                {s.n_turns ?? '—'}{s.n_tools ? ` · ${s.n_tools}🔧` : ''}
+                {s.n_leaks ? <span style={{ color: T.red }}> · {s.n_leaks}⚠</span> : null}
+              </span>
+              <span style={{ fontSize: 11.5, color: failed(s) ? T.red : T.fainter, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {s.reason || (s.check_verdict === 'called' ? 'tool called correctly'
+                  : s.check_verdict === 'spoken_only' ? 'spoke the tool name — never called it'
+                  : s.check_verdict === 'not_called' ? 'tool never called' : '')}
+              </span>
             </div>
             {openUid === s.sim_uid && (
               <div style={{ padding: '14px 20px', background: T.well, borderTop: `1px solid ${T.divider}` }}>
                 {full[s.sim_uid]?.transcript_json
-                  ? <SimTranscript transcript={full[s.sim_uid].transcript_json!} failingTurn={full[s.sim_uid].failing_turn} />
+                  ? (<>
+                      <SimTranscript transcript={full[s.sim_uid].transcript_json!} failingTurn={full[s.sim_uid].failing_turn} />
+                      <ToolCallsStrip calls={full[s.sim_uid].tool_calls_json}
+                        leaks={full[s.sim_uid].tool_leaks_json} summary={full[s.sim_uid].tool_summary_json} />
+                    </>)
                   : <div style={{ color: T.faint, fontSize: 12.5 }}>Loading conversation…</div>}
               </div>
             )}

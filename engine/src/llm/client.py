@@ -39,6 +39,37 @@ def strip_thinking_leaks(text):
     return text.strip()
 
 
+class _ToolCall:
+    """Same shape as the SDK's ChatCompletionMessageToolCall (.id/.function.name/.arguments)."""
+    __slots__ = ("id", "type", "function")
+
+    def __init__(self, call_id, name, arguments):
+        self.id = call_id
+        self.type = "function"
+        self.function = _ToolFn(name, arguments)
+
+
+class _ToolFn:
+    __slots__ = ("name", "arguments")
+
+    def __init__(self, name, arguments):
+        self.name = name
+        self.arguments = arguments or "{}"
+
+
+class _StreamedMessage:
+    """The assembled assistant message, attribute-compatible with the non-streamed one."""
+    __slots__ = ("content", "tool_calls", "finish_reason", "role",
+                 "latency_ms", "ttft_ms", "completion_tokens", "tokens_per_second")
+
+    def __init__(self, content=None, tool_calls=None, finish_reason=None):
+        self.role = "assistant"
+        self.content = content
+        self.tool_calls = tool_calls or []
+        self.finish_reason = finish_reason
+        self.latency_ms = self.ttft_ms = self.completion_tokens = self.tokens_per_second = None
+
+
 class LLMClient:
     _global_semaphore = None
 
@@ -50,7 +81,12 @@ class LLMClient:
         # replace the call's values; anything else (reasoning, top_p, ...) is merged
         # into the request body — how OpenRouter takes reasoning/thinking controls.
         self.params = dict(params or {})
-        self._client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key)
+        # Fail fast, never freeze a run: a single stuck completion used to block for
+        # up to ~30 min (SDK default 600s x retries). 2 min read cap + 1 retry.
+        import httpx as _httpx
+        self._client = AsyncOpenAI(base_url=self.base_url, api_key=self.api_key,
+                                   timeout=_httpx.Timeout(connect=5.0, read=120.0, write=15.0, pool=15.0),
+                                   max_retries=1)
 
         if LLMClient._global_semaphore is None:
             LLMClient._global_semaphore = asyncio.Semaphore(
@@ -95,30 +131,70 @@ class LLMClient:
                          if k not in ("max_tokens", "temperature") and v is not None}
                 if extra:
                     kwargs["extra_body"] = {**(kwargs.get("extra_body") or {}), **extra}
+            # production's gemma5090 plugin sends this on EVERY request (llm.py:201/355),
+            # tools present or not — a turn may legitimately fire several tools at once.
+            kwargs["parallel_tool_calls"] = True
             if tools:
                 kwargs["tools"] = tools
             if seed is not None:  # reproducible judge outputs (vLLM supports it)
                 kwargs["seed"] = seed
             if json_mode:  # force valid JSON at the model layer (vLLM json_object)
                 kwargs["response_format"] = {"type": "json_object"}
+            # STREAM, like production. vLLM's gemma4 tool-call parser takes a different
+            # code path when streaming, and that path is where the raw <|tool_call|> leak
+            # actually originates — a non-streaming eval can never reproduce it. Streaming
+            # also gives a real TTFT, the number the voice stack cares about.
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
             import time as _time
             _t0 = _time.monotonic()
-            response = await self._client.chat.completions.create(**kwargs)
+            stream = await self._client.chat.completions.create(**kwargs)
+            content_parts, tool_slots, usage = [], {}, None
+            ttft = None
+            finish_reason = None
+            async for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage
+                if not getattr(chunk, "choices", None):
+                    continue
+                choice = chunk.choices[0]
+                delta = getattr(choice, "delta", None)
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+                if delta is None:
+                    continue
+                if delta.content:
+                    if ttft is None:
+                        ttft = round((_time.monotonic() - _t0) * 1000.0, 1)
+                    content_parts.append(delta.content)
+                # Accumulate tool calls exactly like LiveKit: a name delta OPENS a call
+                # (keyed by index, since parallel calls interleave), argument deltas are
+                # string-concatenated onto it.
+                for tc in (delta.tool_calls or []):
+                    slot = tool_slots.setdefault(tc.index, {"id": None, "name": "", "args": ""})
+                    if getattr(tc, "id", None):
+                        slot["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if fn.name:
+                            slot["name"] = fn.name
+                            if ttft is None:
+                                ttft = round((_time.monotonic() - _t0) * 1000.0, 1)
+                        if fn.arguments:
+                            slot["args"] += fn.arguments
             _ms = round((_time.monotonic() - _t0) * 1000.0, 1)
-            msg = response.choices[0].message
-            if msg.content:
-                msg.content = strip_thinking_leaks(msg.content)
-            # Per-completion observability (mirrors the voice stack's per-engine metrics:
-            # duration_ms / tokens / tok_per_s). Stamped on the message for callers.
-            try:
-                usage = getattr(response, "usage", None)
-                ctok = getattr(usage, "completion_tokens", None) if usage else None
-                object.__setattr__(msg, "latency_ms", _ms)
-                object.__setattr__(msg, "completion_tokens", ctok)
-                object.__setattr__(msg, "tokens_per_second",
-                                   round(ctok / (_ms / 1000.0), 1) if ctok and _ms > 0 else None)
-            except Exception:
-                pass
+
+            msg = _StreamedMessage(
+                content=strip_thinking_leaks("".join(content_parts)) or None,
+                tool_calls=[_ToolCall(v["id"] or f"call_{k}", v["name"], v["args"])
+                            for k, v in sorted(tool_slots.items()) if v["name"]],
+                finish_reason=finish_reason,
+            )
+            ctok = getattr(usage, "completion_tokens", None) if usage else None
+            msg.latency_ms = _ms
+            msg.ttft_ms = ttft
+            msg.completion_tokens = ctok
+            msg.tokens_per_second = round(ctok / (_ms / 1000.0), 1) if ctok and _ms > 0 else None
             return msg
 
     async def chat_json(self, messages, temperature=0.1, max_tokens=500,

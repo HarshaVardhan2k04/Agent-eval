@@ -4,14 +4,14 @@
 // to POST /api/internal/forge-events.
 const { nanoid } = require('nanoid');
 const { Op } = require('sequelize');
-const { ForgeRun, ForgeProblem, ForgeVersion, ForgeEvent, ForgeDataset, ForgeArena, ForgeSim } = require('../models');
+const { ForgeRun, ForgeProblem, ForgeVersion, ForgeEvent, ForgeDataset, ForgeArena, ForgeSim, ForgeLlm } = require('../models');
 const agentDb = require('../services/agentDbClient');
 const forgeEngine = require('../services/forgeEngineClient');
 const verticalSource = require('../services/verticalSource');
 
 const DEFAULT_SCORING = {
-  best_of_n: 3, votes: 3, confirm_votes: 50, gate_pct: 95, stress_target: 120, milestone_every: 2,
-  max_iterations: 12, plateau_patience: 3, verify_k: 3, composite_margin: 3.0,
+  best_of_n: 1, votes: 3, confirm_votes: 5, gate_pct: 95, stress_target: 120, milestone_every: 2,
+  max_iterations: 5, plateau_patience: 3, verify_k: 3, composite_margin: 3.0,
 };
 
 // A problem applies to a run unless its applicability narrows it out.
@@ -65,6 +65,40 @@ async function deleteDataset(req, res) {
   res.json({ deleted: true });
 }
 
+// ---- saved LLM library -----------------------------------------------------
+// Endpoints the user tests with, saved once, picked forever, editable.
+
+async function listLlms(_req, res) {
+  res.json(await ForgeLlm.findAll({ order: [['created_at', 'DESC']] }));
+}
+
+async function createLlm(req, res) {
+  const b = req.body || {};
+  if (!b.name || !b.base_url || !b.model) return res.status(400).json({ error: 'name, base_url, model required' });
+  const row = await ForgeLlm.create({
+    id: nanoid(10), name: String(b.name).trim(), base_url: String(b.base_url).trim(),
+    model: String(b.model).trim(), api_key: b.api_key || null, params_json: b.params || null,
+  });
+  res.json(row);
+}
+
+async function updateLlm(req, res) {
+  const row = await ForgeLlm.findByPk(req.params.id);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  const b = req.body || {};
+  const patch = { updated_at: new Date() };
+  for (const k of ['name', 'base_url', 'model']) if (b[k] != null && String(b[k]).trim()) patch[k] = String(b[k]).trim();
+  if (b.api_key != null && String(b.api_key).trim()) patch.api_key = String(b.api_key).trim();
+  if ('params' in b) patch.params_json = b.params || null;
+  await row.update(patch);
+  res.json(row);
+}
+
+async function deleteLlm(req, res) {
+  await ForgeLlm.destroy({ where: { id: req.params.id } });
+  res.json({ deleted: true });
+}
+
 // ---- LLM Arena ------------------------------------------------------------
 // N hosted LLMs, each with its OWN prompt, one dataset, full battery, fixed judge.
 // Contestants run SEQUENTIALLY (one inference box) — the run_complete ingest
@@ -96,6 +130,9 @@ async function dispatchArenaContestant(arena, contestant) {
     llm_base_url: contestant.base_url, llm_model: contestant.model,
     llm_api_key: contestant.api_key || undefined,
     llm_params: contestant.params || undefined,
+    ...(run.tools_json && Array.isArray(run.tools_json.enabled)
+        ? { enabled_tools: run.tools_json.enabled, tools_enabled: run.tools_json.enabled.length > 0 }
+        : {}),
     judge_base_url: judge.base_url || undefined, judge_model: judge.model || undefined,
     judge_api_key: judge.api_key || undefined,
   });
@@ -141,6 +178,104 @@ async function testArenaLlm(req, res) {
   }
 }
 
+// Edit ONE contestant's connection config (url/key/model/params) in place.
+// An empty api_key in the patch means "keep the stored key".
+async function updateArenaContestant(req, res) {
+  const arena = await ForgeArena.findByPk(req.params.id);
+  if (!arena) return res.status(404).json({ error: 'arena not found' });
+  const b = req.body || {};
+  // clone before mutate — Sequelize skips same-reference JSONB updates
+  const contestants = JSON.parse(JSON.stringify(arena.contestants_json || []));
+  const c = contestants.find((x) => x.run_id === req.params.runId);
+  if (!c) return res.status(404).json({ error: 'contestant not found' });
+  if (b.base_url != null && String(b.base_url).trim()) c.base_url = String(b.base_url).trim();
+  if (b.model != null && String(b.model).trim()) c.model = String(b.model).trim();
+  if (b.label != null && String(b.label).trim()) c.label = String(b.label).trim();
+  if (b.api_key != null && String(b.api_key).trim()) c.api_key = String(b.api_key).trim();
+  if ('params' in b) c.params = b.params || null; // explicit null clears overrides
+  await arena.update({ contestants_json: contestants });
+  const { api_key, ...safe } = c;
+  res.json({ ok: true, contestant: { ...safe, has_key: !!api_key } });
+}
+
+// Re-evaluate the WHOLE arena with a different judge: conversations stay, only
+// the judging + metrics re-run. Zero calls to the contestant models.
+async function reevaluateArena(req, res) {
+  const arena = await ForgeArena.findByPk(req.params.id);
+  if (!arena) return res.status(404).json({ error: 'arena not found' });
+  const judge = (req.body || {}).judge || null; // {base_url, model, api_key} or null = default
+  const runs = await ForgeRun.findAll({ where: { arena_id: arena.id } });
+  if (runs.some((r) => ['optimizing', 'collecting'].includes(r.status))) {
+    return res.status(400).json({ error: 'a contestant is still running' });
+  }
+  const problems = await applicableProblems({ mode: 'standalone', direction: runs[0]?.direction });
+  const scoring = JSON.parse(JSON.stringify(arena.scoring_json || {}));
+  scoring.judge = judge;
+  await arena.update({ status: 'running', winner_run_id: null, ranking_json: [],
+                       completed_at: null, scoring_json: scoring });
+  const started = [];
+  for (const run of runs) {
+    const sims = await ForgeSim.findAll({
+      where: { run_id: run.id, kind: 'dataset' },
+      attributes: ['sim_uid', 'probe', 'idx', 'transcript_json', 'ended', 'tool_calls_json'],
+      order: [['id', 'ASC']],
+    });
+    if (!sims.length) continue; // nothing stored (e.g. failed before any conversation)
+    const v0 = await ForgeVersion.findOne({ where: { run_id: run.id, version: 0 } });
+    const sp = (v0 && v0.merged_markdown) || String((run.original_prompt_snapshot || {}).blob || '');
+    const configPayload = (v0 && v0.config_json) || { blob: (run.original_prompt_snapshot || {}).blob };
+    await ForgeVersion.destroy({ where: { run_id: run.id } }); // v0 will be re-emitted
+    await run.update({ status: 'optimizing', error_message: null, solved_pct: null,
+                       final_composite: null, completed_at: null, updated_at: new Date() });
+    await forgeEngine.regradeForge(run.id, {
+      sims: sims.map((x) => ({ sim_uid: x.sim_uid, probe: x.probe, idx: x.idx,
+                               transcript: x.transcript_json, ended: x.ended,
+                               tool_calls: x.tool_calls_json || [] })),
+      problems,
+      denominator: run.denominator_snapshot_json || [],
+      system_prompt: sp,
+      config_for_scorer: {},
+      direction: run.direction || 'outbound',
+      gate_pct: Number((run.scoring_json || {}).gate_pct || 95),
+      config_payload: configPayload,
+      greeting: '',
+    }, {
+      judge_base_url: judge ? judge.base_url : undefined,
+      judge_model: judge ? judge.model : undefined,
+      judge_api_key: judge ? judge.api_key : undefined,
+    });
+    started.push(run.id);
+  }
+  res.json({ ok: true, regrading: started });
+}
+
+// Retry ONE contestant from scratch: wipe its data, re-dispatch, reopen the arena.
+async function retryArenaContestant(req, res) {
+  const arena = await ForgeArena.findByPk(req.params.id);
+  if (!arena) return res.status(404).json({ error: 'arena not found' });
+  const contestant = (arena.contestants_json || []).find((c) => c.run_id === req.params.runId);
+  if (!contestant) return res.status(404).json({ error: 'contestant not found' });
+  const run = await ForgeRun.findByPk(contestant.run_id);
+  if (!run) return res.status(404).json({ error: 'run not found' });
+  if (['optimizing', 'collecting'].includes(run.status)) {
+    return res.status(400).json({ error: 'contestant is still running' });
+  }
+  // fresh slate for this run only
+  await ForgeSim.destroy({ where: { run_id: run.id } });
+  await ForgeEvent.destroy({ where: { run_id: run.id } });
+  await ForgeVersion.destroy({ where: { run_id: run.id } });
+  await run.update({ status: 'queued', error_message: null, solved_pct: null,
+                     final_composite: null, current_version: 0, completed_at: null, updated_at: new Date() });
+  await arena.update({ status: 'running', winner_run_id: null, ranking_json: [], completed_at: null });
+  try {
+    await dispatchArenaContestant(arena, contestant);
+  } catch (e) {
+    await run.update({ status: 'failed', error_message: `dispatch failed: ${e.message}`.slice(0, 1000) });
+    return res.status(502).json({ error: `dispatch failed: ${e.message}` });
+  }
+  res.json({ ok: true, run_id: run.id, status: 'optimizing' });
+}
+
 async function createArena(req, res) {
   const b = req.body || {};
   const contestants = Array.isArray(b.contestants) ? b.contestants : [];
@@ -162,12 +297,14 @@ async function createArena(req, res) {
     max_iterations: 0, // evaluate-only — an arena never coaches
     judge: b.judge || null, // optional judge override (default = the engine's env judge)
   };
+  const arenaTools = Array.isArray(b.tools) ? b.tools.filter((t) => typeof t === 'string') : null;
   const arenaId = nanoid(10);
   const enriched = [];
   for (const c of contestants) {
     const runId = nanoid(12);
     await ForgeRun.create({
       id: runId, name: `[arena] ${c.label}`, mode: 'standalone', status: 'queued',
+      tools_json: arenaTools ? { enabled: arenaTools, source: 'manual' } : null,
       dataset_kind: 'authored', dataset_json: { kind: 'authored', n: ds.n, dataset_id: ds.id },
       scoring_json: scoring, direction: b.direction || 'outbound', lead_status: b.lead_status || 'fresh',
       original_prompt_snapshot: { mode: 'standalone', blob: c.prompt },
@@ -204,8 +341,17 @@ async function getArena(req, res) {
   if (!arena) return res.status(404).json({ error: 'not found' });
   const runs = await ForgeRun.findAll({
     where: { arena_id: arena.id },
-    attributes: ['id', 'name', 'status', 'solved_pct', 'final_composite', 'current_version'],
+    attributes: ['id', 'name', 'status', 'solved_pct', 'final_composite', 'current_version', 'error_message'],
   });
+  // failed runs from before error persistence: recover the reason from the event log
+  for (const r of runs) {
+    if (r.status === 'failed' && !r.error_message) {
+      const ev = await ForgeEvent.findOne({
+        where: { run_id: r.id, event_type: 'run_complete' }, order: [['id', 'DESC']],
+      });
+      if (ev && ev.event_data && ev.event_data.error) r.setDataValue('error_message', ev.event_data.error);
+    }
+  }
   // latest per-problem verdicts + metrics for each contestant (the comparison grid)
   const detail = {};
   for (const r of runs) {
@@ -224,6 +370,7 @@ async function getArena(req, res) {
       metrics: v ? v.metrics_json : null,
       sections: v ? v.section_scores_json : null,
       latency: v ? v.latency_json : null,
+      tool_checks: v ? v.tool_checks_json : null,
       activity: lastEv ? { ...lastEv.event_data, at: lastEv.created_at } : null,
     };
   }
@@ -242,6 +389,9 @@ async function deleteArena(req, res) {
 
 async function createRun(req, res) {
   const b = req.body || {};
+  // Tools the agent under test is offered. [] = tools disabled entirely;
+  // omitted = engine default (every tool production can gate on).
+  const toolsSel = Array.isArray(b.tools) ? b.tools.filter((t) => typeof t === 'string') : null;
   const mode = b.mode === 'layered' ? 'layered' : 'standalone';
   const direction = b.direction || 'outbound';
   const lead_status = b.lead_status || 'fresh';
@@ -282,7 +432,7 @@ async function createRun(req, res) {
         });
       }
     }
-    originalSnapshot = { mode, layers: champion.layers };
+    originalSnapshot = { mode, layers: champion.layers, override_keys: champion.override_keys };
   } else {
     champion = { blob: b.standalone_prompt || b.prompt || '' };
     originalSnapshot = { mode, blob: champion.blob };
@@ -334,21 +484,114 @@ async function createRun(req, res) {
 
   await ForgeRun.create({
     id: runId, name: b.name || null, mode, status: 'optimizing',
+    tools_json: toolsSel ? { enabled: toolsSel, source: b.tools_source || 'manual' } : null,
     dataset_kind: b.dataset_kind || 'authored',
     dataset_json: { kind: dataset.kind, n: (dataset.transcripts || dataset.personas || []).length },
     scoring_json: scoring, vertical, language: b.language || null, direction, lead_status,
     original_prompt_snapshot: originalSnapshot,
     layers_json: layersJson, probes_json: probesJson,
+    coach_guidance: b.coach_guidance || null,
+    combos_json: b.combo_resolutions ? { resolutions: b.combo_resolutions } : {},
   });
 
-  const spec = { mode, direction, lead_status, vertical, language: b.language, champion, problems, scoring, dataset };
+  const spec = { mode, direction, lead_status, vertical, language: b.language, champion, problems, scoring, dataset,
+    coach_guidance: b.coach_guidance || null,
+    combo_resolutions: b.combo_resolutions || null };
+  // Optional agent-under-test override (default = the production model / env Gemma).
+  // The judge, customer and coach stay on the fixed judge model regardless.
+  const agent = b.agent_llm || {};
+  const agentConfig = agent.base_url && agent.model ? {
+    llm_base_url: String(agent.base_url).trim(), llm_model: String(agent.model).trim(),
+    llm_api_key: agent.api_key || undefined, llm_params: agent.params || undefined,
+  } : {};
+  if (toolsSel) {
+    agentConfig.enabled_tools = toolsSel;
+    agentConfig.tools_enabled = toolsSel.length > 0;
+  }
   try {
-    await forgeEngine.dispatchForge(runId, spec, {});
+    await forgeEngine.dispatchForge(runId, spec, agentConfig);
   } catch (e) {
     await ForgeRun.update({ status: 'failed', error_message: e.message }, { where: { id: runId } });
     return res.status(502).json({ error: `engine dispatch failed: ${e.message}` });
   }
   res.json({ run_id: runId, status: 'optimizing' });
+}
+
+// The engine re-reads this before EVERY coach proposal, so the operator can steer a run
+// while it is still going. Kept deliberately dumb: one column, no history.
+async function getCoachGuidance(req, res) {
+  const run = await ForgeRun.findByPk(req.params.id, { attributes: ['id', 'coach_guidance'] });
+  if (!run) return res.status(404).json({ error: 'not found' });
+  res.json({ coach_guidance: run.coach_guidance || '' });
+}
+
+async function setCoachGuidance(req, res) {
+  const run = await ForgeRun.findByPk(req.params.id);
+  if (!run) return res.status(404).json({ error: 'not found' });
+  const text = String((req.body || {}).coach_guidance || '').slice(0, 4000);
+  await run.update({ coach_guidance: text, updated_at: new Date() });
+  res.json({ ok: true, coach_guidance: text });
+}
+
+// The human's rulings on combos the prompt could not serve. Storing them RESUMES the run:
+// the engine is re-dispatched with the same champion plus the resolutions, and the
+// written-in content is also handed to the coach as a problem it must fix for real.
+async function resolveCombos(req, res) {
+  const run = await ForgeRun.findByPk(req.params.id);
+  if (!run) return res.status(404).json({ error: 'not found' });
+  if (run.status !== 'awaiting_human') {
+    return res.status(400).json({ error: `run is '${run.status}', not awaiting_human` });
+  }
+  const resolutions = (req.body || {}).resolutions || {};
+  if (!Object.keys(resolutions).length) return res.status(400).json({ error: 'no resolutions supplied' });
+
+  const cj = run.combos_json || {};
+  const blocked = cj.blocked || [];
+  const unresolved = blocked.filter((b) => !resolutions[b.key]).map((b) => b.key);
+  if (unresolved.length) {
+    return res.status(400).json({ error: `still unresolved: ${unresolved.join(', ')}` });
+  }
+  // Anything the human WROTE is a genuine hole in the prompt — tell the coach so the
+  // optimized prompt actually contains it, instead of the gap living only in Forge.
+  const authored = Object.entries(resolutions)
+    .filter(([, r]) => r && r.action === 'content' && (r.text || '').trim())
+    .map(([key, r]) => `- ${key}: the prompt had no greeting for this call; the operator supplied "${String(r.text).slice(0, 200)}". Add it to the campaign layer's greeting_message.`);
+  const guidance = [run.coach_guidance || '', authored.length
+    ? `MISSING PROMPT CONTENT the operator had to supply by hand — fix these in the prompt itself:\n${authored.join('\n')}`
+    : ''].filter(Boolean).join('\n\n').slice(0, 4000);
+
+  const snap = run.original_prompt_snapshot || {};
+  const champion = run.mode === 'layered'
+    ? { layers: { addon: [], ...(snap.layers || {}) }, override_keys: snap.override_keys || {} }
+    : { blob: snap.blob || '' };
+
+  const allProblems = await ForgeProblem.findAll();
+  const problems = allProblems.map((p) => p.toJSON()).map((p) => ({
+    id: p.id, behaviour: p.behaviour, layer_for_fix: p.layer_for_fix,
+    has_detector: p.has_detector, filter_territory: p.filter_territory, winning_lever: p.winning_lever,
+  }));
+
+  await run.update({
+    status: 'optimizing', coach_guidance: guidance,
+    combos_json: { ...cj, resolutions, blocked: [] }, updated_at: new Date(),
+  });
+
+  const spec = {
+    mode: run.mode, direction: run.direction, lead_status: run.lead_status,
+    vertical: run.vertical, language: run.language, champion, problems,
+    scoring: run.scoring_json || {},
+    dataset: { kind: 'authored', personas: run.probes_json || [] },
+    coach_guidance: guidance, combo_resolutions: resolutions,
+  };
+  const agentConfig = (run.tools_json && run.tools_json.enabled)
+    ? { enabled_tools: run.tools_json.enabled, tools_enabled: run.tools_json.enabled.length > 0 } : {};
+  try {
+    await forgeEngine.dispatchForge(run.id, spec, agentConfig);
+  } catch (e) {
+    await run.update({ status: 'failed', error_message: e.message });
+    return res.status(502).json({ error: `engine dispatch failed: ${e.message}` });
+  }
+  res.json({ ok: true, status: 'optimizing', resolutions });
 }
 
 async function listRuns(_req, res) {
@@ -432,13 +675,17 @@ async function ingestForgeEvent(req, res) {
       await ForgeSim.create({
         sim_uid: data.sim_uid, run_id: runId, version: data.version || 0, kind: data.kind,
         problem_id: data.problem_id || null, probe: data.probe || null, idx: data.idx ?? null,
+        combo: data.combo || null,
         transcript_json: data.transcript || [], ended: data.ended ?? null,
         tool_calls_json: data.tool_calls || null,
+        tool_leaks_json: data.tool_leaks || null,
+        tool_summary_json: data.tool_summary || null,
       });
       // slim log line (no transcript) so the progress page can show + link it
       await ForgeEvent.create({ run_id: runId, event_type, event_data: {
         run_id: runId, sim_uid: data.sim_uid, kind: data.kind, problem_id: data.problem_id || null,
         probe: data.probe || null, idx: data.idx ?? null, version: data.version || 0,
+        combo: data.combo || null,
         n_turns: (data.transcript || []).length, ended: data.ended ?? null,
       } });
     } catch (e) { console.warn('[forge sim_recorded]', e.message); }
@@ -474,6 +721,10 @@ async function ingestForgeEvent(req, res) {
         statuses_json: data.statuses || null,
         section_scores_json: data.section_scores || null, metrics_json: data.metrics || null,
         latency_json: data.latency || null,
+        tool_checks_json: (data.tool_checks || data.tool_fixes)
+          ? { ...(data.tool_checks || {}),
+              ...(Array.isArray(data.tool_fixes) && data.tool_fixes.length ? { _fixes: data.tool_fixes } : {}) }
+          : null,
         edits_json: data.edits || null, targeted_problem: data.targeted_problem || null,
         layer_for_fix: data.layer_for_fix || null, verify_json: data.verify || null,
         diagnosis: data.diagnosis || null, how_solved: data.how_solved || null,
@@ -496,9 +747,42 @@ async function ingestForgeEvent(req, res) {
         });
         await run.update({ escalations_json: esc, status: 'awaiting_human', updated_at: new Date() });
       }
+    } else if (event_type === 'combo_matrix') {
+      const run = await ForgeRun.findByPk(runId);
+      await ForgeRun.update({
+        combos_json: { ...(run.combos_json || {}), stages: data.stages, combos: data.combos,
+          allocation: data.allocation, blocked: [] },
+        updated_at: new Date(),
+      }, { where: { id: runId } });
+    } else if (event_type === 'combo_scored') {
+      const run = await ForgeRun.findByPk(runId);
+      const cj = { ...(run.combos_json || {}) };
+      const results = (cj.results || []).filter((r) => r.key !== data.combo);
+      results.push({ key: data.combo, solved_pct: data.solved_pct, composite: data.composite,
+        passed: data.passed, n_sims: data.n_sims });
+      await ForgeRun.update({ combos_json: { ...cj, results }, updated_at: new Date() },
+        { where: { id: runId } });
+    } else if (event_type === 'human_gate') {
+      // The prompt cannot serve some combos. The run is HALTED until a human rules on
+      // them — guessing would test a prompt production never sends.
+      const run = await ForgeRun.findByPk(runId);
+      await ForgeRun.update({
+        status: 'awaiting_human',
+        combos_json: { ...(run.combos_json || {}), stages: data.stages,
+          blocked: data.blocked || [], gate_message: data.message },
+        updated_at: new Date(),
+      }, { where: { id: runId } });
     } else if (event_type === 'run_complete') {
+      // needs_human_combo is the engine's way of saying "I halted, not finished" —
+      // the human_gate handler already set awaiting_human; don't overwrite it with a
+      // terminal-looking status or the resume button disappears.
+      if (data.status === 'needs_human_combo') {
+        await ForgeRun.update({ updated_at: new Date() }, { where: { id: runId } });
+        return res.json({ ok: true });
+      }
       const patch = { status: data.status, current_version: data.final_version, completed_at: new Date(), updated_at: new Date() };
       if (data.solved_pct != null) patch.solved_pct = data.solved_pct;
+      if (data.error) patch.error_message = String(data.error).slice(0, 1000); // the card shows this
       await ForgeRun.update(patch, { where: { id: runId } });
 
       // Arena chain: this contestant finished → dispatch the next queued one, or crown a winner.
@@ -554,17 +838,57 @@ async function ingestForgeEvent(req, res) {
 
 // ---- simulation archive (run-then-grade proof) ----------------------------
 
+// Per-run TOOL REPORT: for every tool the model was offered — how often it was
+// called correctly, hallucinated, or merely SPOKEN (leaked, never executed).
+async function toolReport(req, res) {
+  const sims = await ForgeSim.findAll({
+    where: { run_id: req.params.id },
+    attributes: ['sim_uid', 'kind', 'problem_id', 'probe', 'tool_calls_json', 'tool_leaks_json', 'tool_summary_json'],
+  });
+  const tools = {};
+  const touch = (name) => (tools[name] = tools[name] || { name, fired: 0, unknown: 0, leaked: 0, sims: [] });
+  let offered = new Set();
+  let convosWithTools = 0, convosWithLeaks = 0;
+  for (const s of sims) {
+    const summ = s.tool_summary_json || null;
+    if (summ && Array.isArray(summ.offered)) summ.offered.forEach((n) => offered.add(n));
+    const calls = s.tool_calls_json || [];
+    const leaks = s.tool_leaks_json || [];
+    if (calls.length) convosWithTools += 1;
+    if (leaks.length) convosWithLeaks += 1;
+    for (const c of calls) {
+      const t = touch(c.name);
+      if (String(c.result || '').startsWith('Unknown function')) t.unknown += 1; else t.fired += 1;
+      if (t.sims.length < 12) t.sims.push(s.sim_uid);
+    }
+    for (const l of leaks) {
+      const t = touch(l.name);
+      t.leaked += 1;
+      if (t.sims.length < 12) t.sims.push(s.sim_uid);
+    }
+  }
+  const rows = Object.values(tools).sort((a, b) => (b.fired + b.leaked + b.unknown) - (a.fired + a.leaked + a.unknown));
+  res.json({
+    n_sims: sims.length, convos_with_tools: convosWithTools, convos_with_leaks: convosWithLeaks,
+    offered: Array.from(offered).sort(), tools: rows,
+  });
+}
+
+
 async function listSims(req, res) {
   const where = { run_id: req.params.id };
-  for (const k of ['kind', 'problem_id', 'verdict', 'probe']) {
+  for (const k of ['kind', 'problem_id', 'verdict', 'probe', 'combo']) {
     if (req.query[k]) where[k] = req.query[k];
   }
   if (req.query.version != null && req.query.version !== '') where.version = Number(req.query.version);
   const rows = await ForgeSim.findAll({
     where,
-    attributes: ['id', 'sim_uid', 'version', 'kind', 'problem_id', 'probe', 'idx',
+    attributes: ['id', 'sim_uid', 'version', 'kind', 'problem_id', 'probe', 'idx', 'combo',
                  'ended', 'verdict', 'reason', 'failing_turn', 'created_at',
-                 [require('sequelize').literal('jsonb_array_length(transcript_json)'), 'n_turns']],
+                 [require('sequelize').literal('jsonb_array_length(transcript_json)'), 'n_turns'],
+                 [require('sequelize').literal("coalesce(jsonb_array_length(tool_calls_json), 0)"), 'n_tools'],
+                 [require('sequelize').literal("coalesce(jsonb_array_length(tool_leaks_json), 0)"), 'n_leaks'],
+                 [require('sequelize').literal("tool_summary_json->>'check_verdict'"), 'check_verdict']],
     order: [['id', 'ASC']],
     limit: Math.min(Number(req.query.limit) || 500, 2000),
   });
@@ -703,7 +1027,14 @@ async function evaluateRun(req, res) {
   let champion;
   if (run.mode === 'layered') {
     const layers = (latest && latest.config_json) || (run.original_prompt_snapshot || {}).layers || {};
-    champion = { layers: { addon: [], ...layers }, override_keys: {} };
+    // override_keys are load-bearing: they DELETE a dot-path before that layer merges.
+    // Dropping them here silently produced a different merged prompt than the run's own
+    // baseline. Rebuild them from layers_json (recorded at createRun).
+    const ok = {};
+    for (const l of run.layers_json || []) {
+      if (l && l.layer_type) ok[l.layer_type] = l.override_keys || [];
+    }
+    champion = { layers: { addon: [], ...layers }, override_keys: ok };
   } else {
     const blob = review.edited_prompt
       || (latest && latest.config_json && latest.config_json.blob)
@@ -767,10 +1098,14 @@ async function exportRun(req, res) {
 }
 
 module.exports = {
+  getCoachGuidance,
+  setCoachGuidance,
+  resolveCombos,
   createRun, listRuns, getRun, renameRun, deleteRun, stopRun, getLog, getMatrix, ingestForgeEvent,
   listDatasets, getDataset, createDataset, deleteDataset,
-  createArena, listArenas, getArena, deleteArena, testArenaLlm,
-  listSims, getSim,
+  listLlms, createLlm, updateLlm, deleteLlm,
+  createArena, listArenas, getArena, deleteArena, testArenaLlm, retryArenaContestant, updateArenaContestant, reevaluateArena,
+  listSims, getSim, toolReport,
   listProblems, patchProblem, addProblem,
   listLayers, getLayer, mergePreview,
   answerEscalation, getReview, submitReview, chat, evaluateRun, exportRun,

@@ -34,5 +34,7 @@ app.use('/api/settings', settingsRouter);
 app.use('/api/rag', ragRouter);
 app.use('/api/forge', forgeRouter);
 app.post('/api/internal/forge-events', forgeController.ingestForgeEvent); // engine progress callback
+// engine re-reads the operator's live coach guidance before each proposal
+app.get('/api/internal/forge/:id/coach-guidance', forgeController.getCoachGuidance);
 
 module.exports = app;

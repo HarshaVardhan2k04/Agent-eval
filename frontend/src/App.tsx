@@ -14,7 +14,6 @@ import { CallReportPage } from './pages/CallReportPage'
 import { ScoreboardPage } from './pages/ScoreboardPage'
 import { ScoreboardDetailPage } from './pages/ScoreboardDetailPage'
 import { FlowBuilderPage } from './pages/FlowBuilderPage'
-import { SettingsPage } from './pages/SettingsPage'
 import { LlmPage } from './pages/LlmPage'
 import { ForgeListPage } from './pages/forge/ForgeListPage'
 import { ForgeSetupPage } from './pages/forge/ForgeSetupPage'
@@ -69,7 +68,6 @@ function App() {
           <Route path="/flow" element={<FlowBuilderPage />} />
 
           {/* Settings */}
-          <Route path="/settings" element={<SettingsPage />} />
           <Route path="/llm" element={<LlmPage />} />
 
           <Route path="*" element={<Navigate to="/" replace />} />

@@ -19,19 +19,15 @@ from __future__ import annotations
 
 import re
 
-from src.config import DEFAULT_AGENT_TEMPERATURE
+from src.config import DEFAULT_AGENT_TEMPERATURE, DEFAULT_JUDGE_TEMPERATURE
 
-# end_call tool — same shape the production sims use, so the agent CAN actually end.
-END_CALL_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "end_call",
-        "description": "End the call. Use when the lead wants to stop, is not interested, "
-                       "the business is done, or a loop cannot be broken. Put a short warm "
-                       "goodbye in message.",
-        "parameters": {"type": "object", "properties": {"message": {"type": "string"}}},
-    },
-}]
+from src.tools.definitions import TOOL_DEFINITIONS
+from src.tools import parser as tparse
+
+# The REAL production end_call schema (byte-faithful mirror) — a hand-written
+# variant used to be passed here, so detector runs tested a tool that does not
+# exist in production and no other tool could ever fire.
+END_CALL_TOOL = [TOOL_DEFINITIONS["end_call"]]
 
 # --- shared matchers -------------------------------------------------------
 NON_LATIN = re.compile(r"[^\x00-\x7f]")                 # any non-ASCII letter block (drift proxy)
@@ -41,40 +37,81 @@ ACK = re.compile(r"^\s*(okay|ok|sure|yes|right|alright|got it|understood|certain
                  r"haan|s[aā]re|alag[aā])\b", re.I)
 
 
-async def _agent_turn(llm, system_prompt, convo, tools_on):
-    """One agent turn given a convo of (role, text) with role in {A, L, END}."""
+# warm_transfer_call ends the evaluated conversation too: the call hands off to a
+# human and the supervisor leg is verified outside this system.
+TERMINAL_TOOLS = ("end_call", "voicemail_detected", "warm_transfer_call")
+
+
+async def _agent_turn(llm, system_prompt, convo, tools_on, tool_sim=None):
+    """One agent turn. With tools_on the agent gets the SAME schema list production
+    would offer (via the run's ToolSimulator when available), non-terminal calls are
+    executed and fed back as role:"tool" exactly like production, and every call is
+    recorded with its result. Returns (kind, text, msg, calls)."""
     msgs = [{"role": "system", "content": system_prompt}]
     for r, c in convo:
         if r == "A":
             msgs.append({"role": "assistant", "content": c})
         elif r == "L":
             msgs.append({"role": "user", "content": c})
-    tools = END_CALL_TOOL if tools_on else None
-    msg = await llm.chat(msgs, tools=tools, temperature=DEFAULT_AGENT_TEMPERATURE, max_tokens=100)
+    tools = None
     if tools_on:
-        for tc in (msg.tool_calls or []):
-            if tc.function.name == "end_call":
+        tools = (tool_sim.get_schemas() if tool_sim else None) or END_CALL_TOOL
+    msg = await llm.chat(msgs, tools=tools, temperature=DEFAULT_AGENT_TEMPERATURE, max_tokens=100)
+    calls = []
+    rounds = 0
+    while tools_on and (msg.tool_calls or []) and rounds < 3:
+        rounds += 1
+        terminal = None
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            args = tc.function.arguments or "{}"
+            result = None
+            if tool_sim:
+                try:
+                    result = await tool_sim.execute(name, args)
+                except Exception as e:
+                    result = f"tool_error: {str(e)[:60]}"
+            calls.append({"name": name, "args": args, "result": result})
+            if name in TERMINAL_TOOLS:
                 import json as _json
                 try:
-                    m = _json.loads(tc.function.arguments or "{}").get("message", "")
+                    m = _json.loads(args).get("message", "") or ""
                 except Exception:
                     m = ""
-                return ("END", m, msg)
-    return ("SAY", (msg.content or "").strip(), msg)
+                terminal = m
+            else:
+                msgs.append({"role": "assistant", "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": name, "arguments": args}}]})
+                msgs.append({"role": "tool", "tool_call_id": tc.id, "content": str(result or "")})
+        if terminal is not None:
+            return ("END", terminal, msg, calls)          # production deletes the room here
+        msg = await llm.chat(msgs, tools=tools, temperature=DEFAULT_AGENT_TEMPERATURE, max_tokens=100)
+    return ("SAY", (msg.content or "").strip(), msg, calls)
 
 
-async def _drive(llm, system_prompt, greeting, lead_lines, tools_on=False):
+def _turn_leaks(text, tool_sim):
+    offered = [t["function"]["name"] for t in (tool_sim.get_schemas() if tool_sim else [])]
+    return tparse.find_leaks(text, offered or None)
+
+
+async def _drive(llm, system_prompt, greeting, lead_lines, tools_on=False, tool_sim=None):
     """Drive a scripted conversation; return (convo, ended_index, meta).
     meta maps convo index -> {latency_ms, tokens} for each real agent completion."""
     convo = [("A", greeting or "")]
     ended = None
-    meta = {}
+    meta = {"tool_calls": [], "tool_leaks": []}  # string keys: tool record; int keys: per-turn metrics
     for i, ll in enumerate(lead_lines):
         convo.append(("L", ll))
-        kind, text, msg = await _agent_turn(llm, system_prompt, convo, tools_on)
+        kind, text, msg, calls = await _agent_turn(llm, system_prompt, convo, tools_on, tool_sim)
         idx = len(convo)
         meta[idx] = {"latency_ms": getattr(msg, "latency_ms", None),
+                     "ttft_ms": getattr(msg, "ttft_ms", None),
                      "tokens": getattr(msg, "completion_tokens", None)}
+        for c in calls:   # name + args + RESULT (the result used to be dropped)
+            meta["tool_calls"].append({**c, "turn": idx})
+        for lk in _turn_leaks(text, tool_sim):   # tool SPOKEN, never executed
+            meta.setdefault("tool_leaks", []).append({**lk, "turn": idx})
         if kind == "END":
             ended = i + 1
             convo.append(("END", text))
@@ -111,6 +148,53 @@ RULE_SCENARIOS = {
     "p24": (["not interested", "no really, goodbye"], True),
     "p29": (["hi, tell me about it", "what is the price range", "and the timeline?"], False),
     "p30": (["give me the price range and the options please"], False),
+}
+
+
+# Alternate phrasings per problem. Repeat runs use DIFFERENT wordings of the same
+# situation instead of the identical script — a prompt that only survives one exact
+# phrasing isn't actually fixed, and identical repeats can't reveal that.
+SCENARIO_VARIANTS = {
+    # rule-checked
+    "p1": [["not interested thanks", "I told you, I'm not interested"],
+           ["please don't call me about this", "no means no, remove me"]],
+    "p2": [["I filled the form last week", "I want to move ahead", "what does it cost"],
+           ["yes I enquired earlier", "I'm ready to proceed", "give me the pricing"]],
+    "p3": [["ok", "hmm", "go on", "and", "yes"],
+           ["achha", "hmm", "okay", "hmm", "continue"]],
+    "p12": [["wow, what a fantastic once-in-a-lifetime deal, how lucky am I"],
+            ["oh brilliant, a free offer, you must be doing charity work"]],
+    "p15": [["what's the carpet area and the per square foot rate?"],
+            ["how big is it and how much does it cost?"]],
+    "p20": [["stop calling me, take my number off your list"],
+            ["I'm not interested at all, please remove me"]],
+    "p21": [["did you watch the match yesterday", "what's your favourite food",
+             "tell me something funny", "are you a robot"]],
+    "p22": [["your colleague already helped me", "it's all done", "yep", "thanks, bye"],
+            ["I already booked with someone else", "all sorted", "ok", "thank you"]],
+    "p23": [["tell me everything — sizes, price, amenities, possession, loans"],
+            ["I have many questions, can you walk me through all of it?"]],
+    "p24": [["not interested", "please stop, goodbye"],
+            ["no thanks", "I said no, bye"]],
+    "p29": [["hello, what is this about", "what's the price", "when is possession"],
+            ["hi, go ahead", "and the cost?", "how soon can I move in?"]],
+    "p30": [["give me all the details and options please"],
+            ["list out everything you have"]],
+    # judge-checked
+    "p6": [["hi, I want to know more about the project", "sure, go on"],
+           ["saw your ad, tell me about it", "okay continue"]],
+    "p7": [["hi", "yes go ahead"], ["hello?", "okay tell me"]],
+    "p11": [["that's way over my budget, why should I even consider it?"],
+            ["honestly this seems overpriced, convince me"]],
+    "p13": [["sorry, who is this, which company?"], ["where are you calling from exactly?"]],
+    "p19": [["I lost my mother last week, I really can't talk about this now"],
+            ["there's been a death in the family, this is a bad time"]],
+    "p25": [["hello, who's this?"], ["yes? speaking."]],
+    "p26": [["why would this be free, what's the catch?", "sounds fishy to me"],
+            ["how do you make money then?", "there must be a hidden cost"]],
+    "p27": [["yes I'm interested", "sure let's do it", "go ahead and set it up"],
+            ["okay I want to see it", "yes please arrange it"]],
+    "p31": [["it's been a rough week honestly"], ["I'm quite stressed these days"]],
 }
 
 
@@ -158,10 +242,13 @@ def _ck_lang_drift(convo, ended):
 
 
 def _ck_formatting(convo, ended):
-    entries = _agent_entries(convo)
-    i, t = entries[0] if entries else (None, "")
-    bad = FORMATTING.search(t)
-    return (not bad), ("clean" if not bad else f"has {bad.group()!r}"), (i if bad else None)
+    # scan EVERY agent turn — one leaked em-dash anywhere in the call is a TTS defect,
+    # and in dataset mode the offending turn can be any of them.
+    for i, t in _agent_entries(convo):
+        bad = FORMATTING.search(t or "")
+        if bad:
+            return False, f"has {bad.group()!r}", i
+    return True, "clean — no TTS-unsafe characters", None
 
 
 def _ck_numbers(convo, ended):
@@ -300,8 +387,9 @@ PROMPT_JUDGE_DETECTORS = {
 }
 
 _PROMPT_JUDGE_SYS = ("You are a strict QA rater for a voice-agent SYSTEM PROMPT. Answer the yes/no question "
-                     "about the prompt text itself. Reply as JSON: "
-                     '{"pass": true|false, "reason": "<=12 words"}.')
+                     "about the prompt text itself. When it FAILS, quote the offending snippet so a human "
+                     "can find it. Reply as JSON: "
+                     '{"pass": true|false, "reason": "<=45 words, quote the offending text"}.')
 
 
 async def _prompt_judge(judge_llm, sp, rubric):
@@ -309,9 +397,9 @@ async def _prompt_judge(judge_llm, sp, rubric):
     try:
         data = await judge_llm.chat_json(
             [{"role": "system", "content": _PROMPT_JUDGE_SYS}, {"role": "user", "content": prompt}],
-            temperature=0.0, max_tokens=400, enable_thinking=False,
+            temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=400, enable_thinking=True,
         )
-        return bool(data.get("pass")), str(data.get("reason", ""))[:70], None
+        return bool(data.get("pass")), str(data.get("reason", ""))[:400], None
     except Exception as e:
         return False, f"judge_err {str(e)[:40]}", None
 
@@ -341,7 +429,7 @@ async def grade_judge(judge_llm, rubric, convo):
     try:
         data = await judge_llm.chat_json(
             [{"role": "system", "content": _JUDGE_SYS}, {"role": "user", "content": prompt}],
-            temperature=0.0, max_tokens=400, enable_thinking=False,
+            temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=400, enable_thinking=True,
         )
         ft = data.get("failing_turn")
         ft = int(ft) if isinstance(ft, (int, float)) and 0 <= int(ft) < len(convo) else None
@@ -352,23 +440,36 @@ async def grade_judge(judge_llm, rubric, convo):
 
 # ---- the split API used by the runner --------------------------------------
 
-def scenario_for(problem_id):
-    """(lead_lines, tools_on) for any conversation-based problem, else None."""
+def scenario_for(problem_id, variant=0):
+    """(lead_lines, tools_on) for a conversation-based problem, else None.
+
+    `variant` cycles through the base script plus SCENARIO_VARIANTS, so repeat
+    runs of the same problem use DIFFERENT phrasings of the same situation."""
     if problem_id in RULE_SCENARIOS:
-        return RULE_SCENARIOS[problem_id]
-    if problem_id in LLM_JUDGE_DETECTORS:
-        lines, _rubric, tools = LLM_JUDGE_DETECTORS[problem_id]
-        return (lines, tools)
-    return None
+        base, tools = RULE_SCENARIOS[problem_id]
+    elif problem_id in LLM_JUDGE_DETECTORS:
+        base, _rubric, tools = LLM_JUDGE_DETECTORS[problem_id]
+    else:
+        return None
+    options = [base] + list(SCENARIO_VARIANTS.get(problem_id, []))
+    return (options[int(variant) % len(options)], tools)
 
 
-async def drive_scenario(engine, system_prompt, greeting, problem_id):
-    """GENERATE one conversation for a problem. Returns (convo, ended) or None."""
-    sc = scenario_for(problem_id)
+def variant_count(problem_id):
+    return 1 + len(SCENARIO_VARIANTS.get(problem_id, []))
+
+
+async def drive_scenario(engine, system_prompt, greeting, problem_id, variant=0):
+    """GENERATE one conversation for a problem. Returns (convo, ended, meta) or None."""
+    sc = scenario_for(problem_id, variant)
     if sc is None:
         return None
     lines, tools_on = sc
-    return await _drive(engine.llm, system_prompt, greeting, lines, tools_on=tools_on)  # (convo, ended, meta)
+    sim = getattr(engine, "tool_simulator", None)
+    if sim is not None and tools_on:
+        sim.reset_conversation()      # fresh per-call tool state, like production
+    return await _drive(engine.llm, system_prompt, greeting, lines,
+                        tools_on=tools_on, tool_sim=sim)  # (convo, ended, meta)
 
 
 async def grade_sim(problem_id, convo, ended, judge_llm, system_prompt=None):
@@ -391,8 +492,9 @@ def convo_to_transcript(convo, meta=None):
         role = "agent" if r == "A" else "user" if r == "L" else "agent_end"
         row = {"role": role, "content": c}
         m = (meta or {}).get(i)
-        if m:
+        if isinstance(m, dict):
             row["latency_ms"] = m.get("latency_ms")
+            row["ttft_ms"] = m.get("ttft_ms")
             row["tokens"] = m.get("tokens")
         out.append(row)
     return out
@@ -429,16 +531,16 @@ async def run_detector(engine, system_prompt, problem_id, greeting="", votes=3):
 
     import asyncio as _asyncio
 
-    async def one():
+    async def one(k=0):
         try:
-            convo, ended, _meta = await drive_scenario(engine, system_prompt, greeting, problem_id)
+            convo, ended, _meta = await drive_scenario(engine, system_prompt, greeting, problem_id, variant=k)
             ok, ev, _ft = await grade_sim(problem_id, convo, ended, judge, system_prompt=system_prompt)
             return bool(ok), ev
         except Exception as e:
             return False, f"ERR {str(e)[:40]}"
 
     # Votes run CONCURRENTLY (the global LLM semaphore throttles the endpoint).
-    results = await _asyncio.gather(*[one() for _ in range(votes)])
+    results = await _asyncio.gather(*[one(k) for k in range(votes)])
     passes = sum(1 for ok, _ in results if ok)
     ev = next((e for ok, e in results if ok), results[0][1] if results else "")
     return {"verdict": verdict_from_votes(passes, votes), "passes": passes, "votes": votes,
@@ -474,7 +576,7 @@ async def observe_problem(judge_llm, behaviour, convo):
     try:
         data = await judge_llm.chat_json(
             [{"role": "system", "content": _OBS_JUDGE_SYS}, {"role": "user", "content": prompt}],
-            temperature=0.0, max_tokens=400, enable_thinking=False,
+            temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=400, enable_thinking=True,
         )
         ft = data.get("failing_turn")
         ft = int(ft) if isinstance(ft, (int, float)) and 0 <= int(ft) < len(convo) else None

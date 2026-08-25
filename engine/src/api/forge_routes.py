@@ -58,6 +58,34 @@ async def start_run(req: dict):
     return {"run_id": run_id, "status": "started"}
 
 
+@router.post("/regrade")
+async def regrade_run(req: dict):
+    """Re-judge a run's STORED conversations with a (possibly different) judge."""
+    run_id = req.get("run_id")
+    if not run_id:
+        raise HTTPException(400, "run_id required")
+    if run_id in active_runs:
+        raise HTTPException(400, "Run already active")
+    runner = ForgeRunner(run_id, req.get("config") or {}, req.get("callback_url"))
+    active_runs[run_id] = runner
+
+    async def run_and_store():
+        try:
+            run_results[run_id] = await runner.regrade(req.get("spec") or {})
+        except Exception as e:
+            run_results[run_id] = {"status": "failed", "error": str(e)}
+            try:
+                await runner.bus.emit("run_complete", {"run_id": run_id, "status": "failed",
+                                                       "error": str(e)[:300], "final_version": 0})
+            except Exception:
+                pass
+        finally:
+            active_runs.pop(run_id, None)
+
+    asyncio.create_task(run_and_store())
+    return {"run_id": run_id, "status": "regrading"}
+
+
 @router.post("/evaluate")
 async def evaluate_only(req: dict):
     """Run the baseline pipeline (matrix + stress + deepeval) with NO coaching — for the
@@ -152,8 +180,19 @@ async def merge_preview(req: dict):
     res = fmerge.assemble_for_forge(rows, addons,
                                     call_direction=req.get("direction", "outbound"),
                                     lead_status=req.get("lead_status", "fresh"))
+    # Coverage the RUN will actually test — the same matrix the runner builds, so the
+    # setup page can never disagree with what happens once you press start.
+    from src.forge import combos as fcombo
+    champ = {"layers": {lt: (layers.get(lt) or {}).get("prompt") for lt in ("universal", "vertical", "campaign")},
+             "override_keys": {lt: ((layers.get(lt) or {}).get("override_keys") or [])
+                               for lt in ("universal", "vertical", "campaign")}}
+    champ["layers"]["addon"] = addons
+    matrix = fcombo.build_matrix("layered", champ)
     return {"markdown": res["markdown"], "greeting": res["greeting"],
-            "flow_stage": res["flow_stage"], "flow_error": res["flow_error"]}
+            "flow_stage": res["flow_stage"], "flow_error": res["flow_error"],
+            "coverage": {"stages": matrix["stages"],
+                         "combos": [c["key"] for c in matrix["combos"]],
+                         "blocked": matrix["blocked"]}}
 
 
 @router.post("/{run_id}/chat")

@@ -10,6 +10,7 @@ module.exports = (sequelize, DataTypes) =>
       status: { type: DataTypes.TEXT, allowNull: false, defaultValue: 'collecting' },
       dataset_kind: { type: DataTypes.TEXT, allowNull: true }, // real | authored
       dataset_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+      tools_json: { type: DataTypes.JSONB, allowNull: true }, // {enabled:[], source}
       scoring_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
       vertical: { type: DataTypes.TEXT, allowNull: true },
       language: { type: DataTypes.TEXT, allowNull: true },
@@ -22,6 +23,11 @@ module.exports = (sequelize, DataTypes) =>
       probes_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },      // dataset personas/probes
       escalations_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] }, // coach->human questions
       review_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },      // Phase-2 human review state
+      // {stages, combos, allocation, blocked, resolutions, results} — the direction x
+      // lead_status cross-product this run covers, and the human's rulings on gaps.
+      combos_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+      // operator's live instructions to the coach, per run, editable mid-run
+      coach_guidance: { type: DataTypes.TEXT, allowNull: true },
       final_composite: { type: DataTypes.REAL, allowNull: true },
       solved_pct: { type: DataTypes.REAL, allowNull: true },
       current_version: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },

@@ -302,6 +302,10 @@ export const api = {
     const q = filters ? '?' + new URLSearchParams(Object.entries(filters).map(([k, v]) => [k, String(v)])).toString() : ''
     return request(`/api/forge/runs/${runId}/sims${q}`)
   },
+  forgeToolReport(runId: string): Promise<{ n_sims: number; convos_with_tools: number; convos_with_leaks: number
+    offered: string[]; tools: { name: string; fired: number; unknown: number; leaked: number; sims: string[] }[] }> {
+    return request(`/api/forge/runs/${runId}/tool-report`)
+  },
   getForgeSim(uid: string) {
     return request(`/api/forge/sims/${uid}`)
   },
@@ -310,6 +314,28 @@ export const api = {
   },
   getForgeArena(id: string) {
     return request(`/api/forge/arenas/${id}`)
+  },
+  updateArenaContestant(arenaId: string, runId: string, body: Record<string, unknown>) {
+    return request(`/api/forge/arenas/${arenaId}/contestants/${runId}`, { method: 'PATCH', body: JSON.stringify(body) })
+  },
+  // saved LLM endpoints library
+  listForgeLlms(): Promise<{ id: string; name: string; base_url: string; model: string; api_key: string | null; params_json: Record<string, unknown> | null }[]> {
+    return request('/api/forge/llms')
+  },
+  createForgeLlm(body: Record<string, unknown>) {
+    return request('/api/forge/llms', { method: 'POST', body: JSON.stringify(body) })
+  },
+  updateForgeLlm(id: string, body: Record<string, unknown>) {
+    return request(`/api/forge/llms/${id}`, { method: 'PATCH', body: JSON.stringify(body) })
+  },
+  deleteForgeLlm(id: string) {
+    return request(`/api/forge/llms/${id}`, { method: 'DELETE' })
+  },
+  reevaluateArena(arenaId: string, body: Record<string, unknown>) {
+    return request(`/api/forge/arenas/${arenaId}/reevaluate`, { method: 'POST', body: JSON.stringify(body) })
+  },
+  retryArenaContestant(arenaId: string, runId: string) {
+    return request(`/api/forge/arenas/${arenaId}/retry/${runId}`, { method: 'POST' })
   },
   deleteForgeArena(id: string) {
     return request(`/api/forge/arenas/${id}`, { method: 'DELETE' })
@@ -322,6 +348,19 @@ export const api = {
     return request(`/api/forge/datasets/${id}`)
   },
   // Production-faithful merged preview (markdown + greeting + sliced stage)
+  forgeCoachGuidance(runId: string): Promise<{ coach_guidance: string }> {
+    return request(`/api/forge/runs/${runId}/coach-guidance`)
+  },
+  forgeSetCoachGuidance(runId: string, text: string) {
+    return request(`/api/forge/runs/${runId}/coach-guidance`, {
+      method: 'PUT', body: JSON.stringify({ coach_guidance: text }),
+    })
+  },
+  forgeResolveCombos(runId: string, resolutions: Record<string, { action: string; text?: string }>) {
+    return request(`/api/forge/runs/${runId}/combo-resolutions`, {
+      method: 'POST', body: JSON.stringify({ resolutions }),
+    })
+  },
   forgeMergePreview(body: Record<string, unknown>) {
     return request('/api/forge/merge-preview', { method: 'POST', body: JSON.stringify(body) })
   },

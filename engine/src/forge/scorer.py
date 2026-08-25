@@ -57,6 +57,19 @@ def _scenario_from_probe(probe: dict, prompt_bundle: dict, direction: str) -> di
     return sc
 
 
+# Tool names the agent must CALL, never say. Matched as whole words on the spoken text.
+def _spoken_tool_leaks(transcript, available_tools):
+    import re as _re
+    names = [t for t in (available_tools or []) if t] or [
+        "end_call", "voicemail_detected", "handle_call_screening", "date_calculator",
+        "warm_transfer_call", "search_knowledge_base", "send_whatsapp_template",
+        "switch_agent", "web_search", "get_location_details", "irrelevant_interruption",
+    ]
+    text = " ".join((t.get("content") or "") for t in (transcript or [])
+                    if t.get("role") in ("agent", "agent_end"))
+    return [n for n in names if _re.search(rf"\b{_re.escape(n)}\b", text)]
+
+
 def _median(vals):
     vals = [v for v in vals if v is not None]
     return round(statistics.median(vals), 2) if vals else None
@@ -98,19 +111,31 @@ async def score_probe(
             "transcript": transcript_to_lines(transcript),
             "call_direction": direction,
             "available_tools": available_tools or [],
-            "tool_events": [{"name": f} for f in fired],
+            "tool_events": [{"name": t.get("name"), "args": t.get("args"), "result": t.get("result")}
+                            for t in (sim.get("tool_calls") or []) if t.get("name")],
         }
         try:
             result = await evaluator.evaluate(call)
         except Exception as e:  # a single bad rollout must not kill the probe
             result = {"gated_reason": f"score_error: {str(e)[:120]}", "composite_score": None,
                       "sections": {}, "metrics": {}, "areas_of_improvement": []}
-        # No tool was fired in this rollout -> there is nothing to grade. A judged score
-        # here is speculation (it punished prompts that MENTION tools when none were
-        # needed), so exclude the metric instead of recording a fake number.
-        if not fired and isinstance(result.get("metrics"), dict):
-            result["metrics"]["tool_calling"] = None
-        samples.append({"transcript": transcript, "result": result})
+        # tool_calling is CODE-COMPUTED, never judged: valid calls / attempts, where an
+        # attempt is a real tool_call OR a tool name SPOKEN as text (the classic
+        # "...Have a good day. end_call" leak — the model thinks it hung up, the line
+        # stays open). A judged score here used to report 100 while the agent was
+        # literally typing the tool name instead of calling it.
+        leaks = _spoken_tool_leaks(transcript, available_tools or [])
+        if isinstance(result.get("metrics"), dict):
+            attempts = len(fired) + len(leaks)
+            if attempts == 0:
+                result["metrics"]["tool_calling"] = None  # nothing attempted -> not judgeable
+            else:
+                result["metrics"]["tool_calling"] = round(100.0 * len(fired) / attempts, 1)
+        if leaks:
+            result.setdefault("areas_of_improvement", []).append(
+                f"spoke the tool name instead of calling it: {', '.join(sorted(set(leaks)))}")
+        samples.append({"transcript": transcript, "result": result,
+                        "tool_calls": sim.get("tool_calls") or [], "leaks": leaks})
 
     scored = [s for s in samples if s["result"].get("composite_score") is not None]
     composites = [s["result"]["composite_score"] for s in scored]
@@ -146,4 +171,6 @@ async def score_probe(
         "areas_of_improvement": (rep["result"].get("areas_of_improvement") if rep else []),
         "representative_transcript": (rep["transcript"] if rep else []),
         "all_transcripts": [s["transcript"] for s in samples],
+        "all_tool_calls": [s["tool_calls"] for s in samples],
+        "spoken_tool_leaks": sorted({n for s in samples for n in s["leaks"]}),
     }

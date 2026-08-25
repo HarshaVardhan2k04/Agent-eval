@@ -34,6 +34,7 @@ const ForgeEvent = require('./ForgeEvent')(sequelize, DataTypes);
 const ForgeDataset = require('./ForgeDataset')(sequelize, DataTypes);
 const ForgeArena = require('./ForgeArena')(sequelize, DataTypes);
 const ForgeSim = require('./ForgeSim')(sequelize, DataTypes);
+const ForgeLlm = require('./ForgeLlm')(sequelize, DataTypes);
 
 // --- associations ---
 Eval.hasMany(PromptVersion, { foreignKey: 'eval_id', onDelete: 'CASCADE' });
@@ -77,4 +78,5 @@ module.exports = {
   ForgeDataset,
   ForgeArena,
   ForgeSim,
+  ForgeLlm,
 };

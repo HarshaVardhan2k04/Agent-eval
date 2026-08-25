@@ -3,11 +3,11 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { T, card, label, btnPrimary, backBtn } from '../../theme'
 import { api } from '../../api/client'
 import { score100Color, METRIC_LABELS } from '../../components/analysis'
-import { RunStatusChip, VerdictCell, ProofPanel } from '../../components/forge'
+import { RunStatusChip, VerdictCell, ProofPanel , SizeHint } from '../../components/forge'
 import { useForgeStore } from '../../stores/forgeStore'
 
-type Contestant = { label: string; base_url: string; model: string; api_key?: string; prompt: string; run_id?: string }
-type ArenaRun = { id: string; name: string; status: string; solved_pct: number | null; final_composite: number | null }
+type Contestant = { label: string; base_url: string; model: string; api_key?: string; params?: Record<string, unknown> | null; prompt: string; run_id?: string }
+type ArenaRun = { id: string; name: string; status: string; solved_pct: number | null; final_composite: number | null; error_message?: string | null }
 type Ranking = { run_id: string; deepeval_avg: number | null; composite: number | null; solved_pct: number | null }
 type Arena = {
   id: string; name: string; status: string; dataset_id: string; winner_run_id: string | null
@@ -16,6 +16,7 @@ type Arena = {
     statuses: Record<string, { verdict: string; evidence?: string }>
     metrics: Record<string, number | null> | null
     activity?: { phase: string; done: number; total: number; problem_id?: string; probe?: string; verdict?: string | null; at: string } | null
+    tool_checks?: Record<string, { verdict: string; called: number; spoken_only: number; not_called: number; n: number }> | null
     latency?: { avg_ms: number; p50_ms: number; p99_ms: number; n_turns: number
       tokens_avg?: number | null; long_turn_pct?: number | null
       detail: { probe: string; turns: { ms: number; tokens?: number | null; text: string }[] }[] } | null
@@ -51,7 +52,7 @@ function ArenaList({ nav }: { nav: (p: string) => void }) {
         <div>
           <h1 style={{ fontSize: 26, fontWeight: 650, margin: 0, color: T.text }}>LLM Arena</h1>
           <p style={{ fontSize: 13.5, color: T.muted, margin: '6px 0 0' }}>
-            Choose your LLMs, give each its own prompt, and let the deepeval battery decide — first pass only, fixed judge.
+            Choose your LLMs, give each its own prompt and the same tools, and compare them on one dataset — first pass only, fixed judge.
           </p>
         </div>
         {!creating && <button onClick={() => setCreating(true)} style={btnPrimary}>+ New arena</button>}
@@ -83,7 +84,7 @@ function ArenaList({ nav }: { nav: (p: string) => void }) {
           {arenas.length === 0 && (
             <div style={{ padding: '44px 24px', textAlign: 'center' }}>
               <div style={{ fontSize: 18, fontWeight: 650, color: T.text }}>No arenas yet</div>
-              <div style={{ fontSize: 13, color: T.muted, marginTop: 7 }}>Select N LLMs, give each its prompt, pick a dataset — the battery decides.</div>
+              <div style={{ fontSize: 13, color: T.muted, marginTop: 7 }}>Select N LLMs, give each its prompt, pick a dataset — same tools, same judge, side by side.</div>
             </div>
           )}
         </div>
@@ -102,6 +103,20 @@ function ArenaCreate({ nav, onCancel }: { nav: (p: string) => void; onCancel: ()
   const [datasets, setDatasets] = useState<{ id: string; name: string; n: number }[]>([])
   const [datasetId, setDatasetId] = useState('')
   const [battery, setBattery] = useState(false) // default: single pass — no retries
+  // Tools every contestant is offered — identical set for all of them, otherwise the
+  // comparison isn't fair. Core four are always on (production loads them ungated).
+  const CORE_LOCKED = ['end_call', 'voicemail_detected', 'handle_call_screening', 'date_calculator']
+  const GATED_TOOLS: { name: string; desc: string }[] = [
+    { name: 'warm_transfer_call', desc: 'escalate to a human' },
+    { name: 'switch_agent', desc: 'hand off to another agent' },
+    { name: 'irrelevant_interruption', desc: 'flag off-topic talk' },
+    { name: 'search_knowledge_base', desc: 'look a fact up' },
+    { name: 'web_search', desc: 'search the live web' },
+    { name: 'send_whatsapp_template', desc: 'send a WhatsApp message' },
+    { name: 'get_location_details', desc: 'distance / nearby' },
+  ]
+  const [gatedTools, setGatedTools] = useState<string[]>(GATED_TOOLS.map((t) => t.name))
+  const [toolChecks, setToolChecks] = useState(true)
   const [confirmVotes, setConfirmVotes] = useState(30)
   const [stress, setStress] = useState(24)
   const [judgeModal, setJudgeModal] = useState(false)
@@ -113,6 +128,32 @@ function ArenaCreate({ nav, onCancel }: { nav: (p: string) => void; onCancel: ()
   // pre-flight per row: send "hi" to the endpoint before the prompt step
   type TestState = { status: 'idle' | 'testing' | 'ok' | 'fail'; msg?: string; ms?: number }
   const [tests, setTests] = useState<Record<number, TestState>>({})
+  type SavedLlm = { id: string; name: string; base_url: string; model: string; api_key: string | null; params_json: Record<string, unknown> | null }
+  const [savedLlms, setSavedLlms] = useState<SavedLlm[]>([])
+  const [savedPick, setSavedPick] = useState('')
+  useEffect(() => { api.listForgeLlms().then(setSavedLlms).catch(() => {}) }, [])
+  const addSaved = () => {
+    const row = savedLlms.find((x) => x.id === savedPick)
+    if (!row) return
+    const pr = (row.params_json || {}) as Record<string, unknown>
+    const reasoning = pr.reasoning as { enabled?: boolean; effort?: string } | undefined
+    setLlms((cs) => {
+      const next = [...cs]
+      // fill the first EMPTY row, else append
+      const idx = next.findIndex((c) => !c.label.trim() && !c.base_url.trim() && !c.model.trim())
+      const filled = { label: row.name, base_url: row.base_url, model: row.model, api_key: row.api_key || '', prompt: idx >= 0 ? next[idx].prompt : '' }
+      const at = idx >= 0 ? idx : next.length
+      if (idx >= 0) next[idx] = filled; else next.push(filled)
+      setCparams((ps) => ({ ...ps, [at]: {
+        max_tokens: pr.max_tokens != null ? String(pr.max_tokens) : '',
+        temperature: pr.temperature != null ? String(pr.temperature) : '',
+        thinking: reasoning ? (reasoning.enabled === false ? 'off' : (reasoning.effort as string) || 'default') : 'default',
+        extra: '',
+      } }))
+      return next
+    })
+    setSavedPick('')
+  }
   // per-row request parameters (thinking level, max_tokens, ...) sent verbatim with
   // every call this contestant makes — and with its pre-flight test.
   type CParams = { max_tokens?: string; temperature?: string; thinking?: string; extra?: string }
@@ -177,9 +218,10 @@ function ArenaCreate({ nav, onCancel }: { nav: (p: string) => void; onCancel: ()
       const body: Record<string, unknown> = {
         name: name.trim() || null, dataset_id: datasetId,
         contestants: llms.map((c, i) => ({ ...c, params: buildParams(i) || null })),
+        tools: [...CORE_LOCKED, ...gatedTools],
         scoring: battery
-          ? { single_pass: false, votes: 3, confirm_votes: confirmVotes, best_of_n: 2, stress_target: stress }
-          : { single_pass: true },
+          ? { single_pass: false, votes: 3, confirm_votes: confirmVotes, best_of_n: 2, stress_target: stress, tool_checks: toolChecks }
+          : { single_pass: true, tool_checks: toolChecks },
       }
       if (changeJudge && judge.base_url.trim() && judge.model.trim()) body.judge = judge
       const r = await api.createForgeArena(body)
@@ -281,10 +323,23 @@ function ArenaCreate({ nav, onCancel }: { nav: (p: string) => void; onCancel: ()
                 )}
               </div>
             )})}
-            <button onClick={() => setLlms((cs) => [...cs, { label: '', base_url: '', model: '', api_key: '', prompt: '' }])}
-              style={{ margin: 10, padding: '7px 14px', borderRadius: 9, border: `1px dashed ${T.border2}`, background: 'transparent', color: T.muted, fontSize: 12.5, cursor: 'pointer' }}>
-              + Add an LLM
-            </button>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', margin: 10 }}>
+              <button onClick={() => setLlms((cs) => [...cs, { label: '', base_url: '', model: '', api_key: '', prompt: '' }])}
+                style={{ padding: '7px 14px', borderRadius: 9, border: `1px dashed ${T.border2}`, background: 'transparent', color: T.muted, fontSize: 12.5, cursor: 'pointer' }}>
+                + Add an LLM
+              </button>
+              <select value={savedPick} onChange={(e) => setSavedPick(e.target.value)}
+                style={{ padding: '7px 10px', borderRadius: 9, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12.5 }}>
+                <option value="">— from saved LLMs —</option>
+                {savedLlms.map((l) => <option key={l.id} value={l.id}>{l.name} · {l.model}</option>)}
+              </select>
+              {savedPick && (
+                <button onClick={addSaved}
+                  style={{ padding: '7px 14px', borderRadius: 9, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 12.5, fontWeight: 700, cursor: 'pointer' }}>
+                  Fill row
+                </button>
+              )}
+            </div>
           </div>
           <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
             <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Arena name (optional)" style={{ ...inp, width: 300 }} />
@@ -321,6 +376,51 @@ function ArenaCreate({ nav, onCancel }: { nav: (p: string) => void; onCancel: ()
               <input type="number" value={stress} min={6} max={300} onChange={(e) => setStress(Number(e.target.value) || 24)} style={{ ...inp, width: 70 }} />
             </>)}
           </div>
+          {/* tools every contestant is offered — identical for all, or it isn't a fair fight */}
+          <div style={{ ...card, padding: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 9, flexWrap: 'wrap' }}>
+              <span style={label}>Tools every LLM gets</span>
+              <span style={{ fontSize: 11.5, color: T.fainter }}>
+                the same set for all contestants — offered exactly as production offers them
+              </span>
+              <label style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 7, fontSize: 12, color: T.muted, cursor: 'pointer' }}>
+                <input type="checkbox" checked={toolChecks} onChange={(e) => setToolChecks(e.target.checked)} />
+                run tool checks
+                <span className="hint-wrap">
+                  <span style={{ width: 14, height: 14, borderRadius: 99, border: `1px solid ${T.border2}`, color: T.fainter, fontSize: 9.5, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', cursor: 'help' }}>?</span>
+                  <span className="hint-box">
+                    Two scripted conversations per tool force the exact situation it exists for, and we check
+                    whether each LLM actually CALLED it — or only said its name. Adds {(gatedTools.length * 2 + 9)} conversations per LLM.
+                  </span>
+                </span>
+              </label>
+            </div>
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 9 }}>
+              {CORE_LOCKED.map((n) => (
+                <span key={n} title="always on — production loads these ungated"
+                  style={{ padding: '4px 10px', borderRadius: 99, fontSize: 11, fontFamily: T.mono,
+                           background: T.chip, color: T.muted, border: `1px solid ${T.border2}` }}>🔒 {n}</span>
+              ))}
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(215px,1fr))', gap: 6 }}>
+              {GATED_TOOLS.map((t) => {
+                const on = gatedTools.includes(t.name)
+                return (
+                  <div key={t.name} onClick={() => setGatedTools(on ? gatedTools.filter((x) => x !== t.name) : [...gatedTools, t.name])}
+                    style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '7px 10px', borderRadius: 9, cursor: 'pointer',
+                             border: `1px solid ${on ? 'var(--accent)' : T.border}`, background: on ? T.accentSoft : T.surface2 }}>
+                    <span style={{ width: 7, height: 7, borderRadius: 99, background: on ? 'var(--accent)' : T.border2, flexShrink: 0 }} />
+                    <span style={{ fontFamily: T.mono, fontSize: 11.5, color: on ? T.text : T.faint }}>{t.name}</span>
+                    <span style={{ fontSize: 10.5, color: T.fainter, marginLeft: 'auto', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.desc}</span>
+                  </div>
+                )
+              })}
+            </div>
+            <div style={{ fontSize: 11.5, color: T.fainter, marginTop: 8 }}>
+              {CORE_LOCKED.length + gatedTools.length} tools offered to each LLM
+            </div>
+          </div>
+
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(420px, 1fr))', gap: 12 }}>
             {llms.map((c, i) => (
               <div key={i} style={{ ...card, padding: 14, borderTop: `3px solid ${C_COLORS[i % C_COLORS.length]}` }}>
@@ -335,6 +435,7 @@ function ArenaCreate({ nav, onCancel }: { nav: (p: string) => void; onCancel: ()
                 <textarea value={c.prompt} onChange={(e) => upd(i, { prompt: e.target.value })} rows={6}
                   placeholder={`The system prompt ${c.label || 'this LLM'} competes with…`}
                   style={{ width: '100%', boxSizing: 'border-box', padding: '10px 12px', borderRadius: 9, background: T.well, border: `1px solid ${T.border2}`, color: T.text2, fontSize: 12, fontFamily: T.mono, lineHeight: 1.5, outline: 'none', resize: 'vertical' }} />
+                <SizeHint text={c.prompt} label={c.label || 'prompt'} warnTokens={8000} />
               </div>
             ))}
           </div>
@@ -394,6 +495,67 @@ function ArenaDetail({ id, nav }: { id: string; nav: (p: string) => void }) {
   const [latOpen, setLatOpen] = useState<string | null>(null)
   // proof drawer: which contestant-run + problem the user clicked in the grid
   const [proof, setProof] = useState<{ runId: string; pid: string } | null>(null)
+  // per-contestant connection editor (url / key / model / params), saved in place
+  const [editing, setEditing] = useState<string | null>(null)
+  const [edit, setEdit] = useState<{ base_url: string; model: string; api_key: string; max_tokens: string; temperature: string; thinking: string; extra: string }>({ base_url: '', model: '', api_key: '', max_tokens: '', temperature: '', thinking: 'default', extra: '' })
+  const [editMsg, setEditMsg] = useState<string | null>(null)
+  // bottom-of-page: swap the judge and re-grade every stored conversation
+  const [rejudge, setRejudge] = useState({ base_url: '', model: '', api_key: '' })
+  const [rejudgeMsg, setRejudgeMsg] = useState<string | null>(null)
+  const [rejudgeBusy, setRejudgeBusy] = useState(false)
+  useEffect(() => { api.llmInfo().then((d: { base_url?: string; model?: string }) =>
+    setRejudge((x) => ({ ...x, base_url: x.base_url || d.base_url || '', model: x.model || d.model || '' }))).catch(() => {}) }, [])
+  const runReevaluate = async () => {
+    if (rejudgeBusy) return
+    setRejudgeBusy(true); setRejudgeMsg(null)
+    try {
+      const body = rejudge.base_url.trim() && rejudge.model.trim()
+        ? { judge: { base_url: rejudge.base_url.trim(), model: rejudge.model.trim(), api_key: rejudge.api_key.trim() || undefined } }
+        : {}
+      await api.reevaluateArena(id, body)
+      location.reload()
+    } catch (e) { setRejudgeMsg(e instanceof Error ? e.message : 'failed'); setRejudgeBusy(false) }
+  }
+  const openEdit = (c: Contestant) => {
+    const pr = (c.params || {}) as Record<string, unknown>
+    const reasoning = pr.reasoning as { enabled?: boolean; effort?: string } | undefined
+    const extraObj = Object.fromEntries(Object.entries(pr).filter(([k]) => !['max_tokens', 'temperature', 'reasoning'].includes(k)))
+    setEdit({
+      base_url: c.base_url, model: c.model, api_key: '',
+      max_tokens: pr.max_tokens != null ? String(pr.max_tokens) : '',
+      temperature: pr.temperature != null ? String(pr.temperature) : '',
+      thinking: reasoning ? (reasoning.enabled === false ? 'off' : reasoning.effort || 'default') : 'default',
+      extra: Object.keys(extraObj).length ? JSON.stringify(extraObj) : '',
+    })
+    setEditMsg(null)
+    setEditing(c.run_id || null)
+  }
+  const buildEditParams = (): Record<string, unknown> | null => {
+    const out: Record<string, unknown> = {}
+    if (edit.max_tokens.trim()) out.max_tokens = parseInt(edit.max_tokens, 10)
+    if (edit.temperature.trim()) out.temperature = parseFloat(edit.temperature)
+    if (edit.thinking !== 'default') out.reasoning = edit.thinking === 'off' ? { enabled: false } : { effort: edit.thinking }
+    if (edit.extra.trim()) { try { Object.assign(out, JSON.parse(edit.extra)) } catch { /* ignored */ } }
+    return Object.keys(out).length ? out : null
+  }
+  const saveEdit = async (c: Contestant) => {
+    try {
+      await api.updateArenaContestant(id, c.run_id || '', {
+        base_url: edit.base_url, model: edit.model,
+        api_key: edit.api_key.trim() || undefined, params: buildEditParams(),
+      })
+      setEditMsg('saved ✓ — Retry uses the new config')
+      setTimeout(() => { setEditing(null); location.reload() }, 700)
+    } catch (e) { setEditMsg(e instanceof Error ? e.message : 'save failed') }
+  }
+  const testEdit = async () => {
+    setEditMsg('testing…')
+    try {
+      const r = await api.testArenaLlm({ base_url: edit.base_url, model: edit.model,
+        api_key: edit.api_key.trim() || undefined, params: buildEditParams() || undefined })
+      setEditMsg(r.ok ? `✓ replied in ${r.ms}ms — "${r.reply}"` : `✕ ${r.error}`)
+    } catch { setEditMsg('✕ request failed') }
+  }
   const { problems, fetchProblems } = useForgeStore()
   useEffect(() => { fetchProblems() }, [fetchProblems])
   useEffect(() => {
@@ -460,11 +622,69 @@ function ArenaDetail({ id, nav }: { id: string; nav: (p: string) => void }) {
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <span style={{ fontSize: 13, fontWeight: 700, color: T.text }}>{c.label}</span>
                 {isWin && <span style={{ fontSize: 13 }}>🏆</span>}
-                <span style={{ marginLeft: 'auto' }}>{r && (
-                  <RunStatusChip status={r.status}
-                    label={r.status === 'optimizing' ? 'Testing' : ['llm_complete', 'converged_below_gate'].includes(r.status) ? 'Done' : undefined} />
-                )}</span>
+                <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <button onClick={(e) => { e.stopPropagation(); editing === c.run_id ? setEditing(null) : openEdit(c) }}
+                    title="Edit this LLM's URL / key / model / params"
+                    style={{ width: 24, height: 24, borderRadius: 7, border: `1px solid ${editing === c.run_id ? 'var(--accent)' : T.border2}`,
+                             background: editing === c.run_id ? 'var(--accent)' : 'transparent',
+                             color: editing === c.run_id ? '#fff' : T.faint, cursor: 'pointer', fontSize: 11.5 }}>✎</button>
+                  {r && (
+                    <RunStatusChip status={r.status}
+                      label={r.status === 'optimizing' ? 'Testing' : ['llm_complete', 'converged_below_gate'].includes(r.status) ? 'Done' : undefined} />
+                  )}
+                </span>
               </div>
+              {editing === c.run_id && (
+                <div onClick={(e) => e.stopPropagation()}
+                  style={{ marginTop: 8, padding: '10px 11px', borderRadius: 9, background: T.well, border: `1px solid ${T.border2}`, display: 'flex', flexDirection: 'column', gap: 7 }}>
+                  <input value={edit.base_url} onChange={(e) => setEdit({ ...edit, base_url: e.target.value })} placeholder="base URL (…/v1)"
+                    style={{ padding: '6px 9px', borderRadius: 7, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12, fontFamily: T.mono }} />
+                  <div style={{ display: 'flex', gap: 7 }}>
+                    <input value={edit.model} onChange={(e) => setEdit({ ...edit, model: e.target.value })} placeholder="model id"
+                      style={{ flex: 1, padding: '6px 9px', borderRadius: 7, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12, fontFamily: T.mono }} />
+                    <input value={edit.api_key} onChange={(e) => setEdit({ ...edit, api_key: e.target.value })} type="password" placeholder="new key (blank = keep)"
+                      style={{ width: 130, padding: '6px 9px', borderRadius: 7, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12 }} />
+                  </div>
+                  <div style={{ display: 'flex', gap: 7, alignItems: 'center', flexWrap: 'wrap', fontSize: 11.5, color: T.muted }}>
+                    <select value={edit.thinking} onChange={(e) => setEdit({ ...edit, thinking: e.target.value })}
+                      style={{ padding: '5px 7px', borderRadius: 7, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 11.5 }}>
+                      <option value="default">thinking: default</option><option value="off">thinking: off</option>
+                      <option value="low">thinking: low</option><option value="medium">thinking: medium</option><option value="high">thinking: high</option>
+                    </select>
+                    <input value={edit.max_tokens} onChange={(e) => setEdit({ ...edit, max_tokens: e.target.value })} placeholder="max tok"
+                      style={{ width: 62, padding: '5px 7px', borderRadius: 7, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 11.5 }} />
+                    <input value={edit.temperature} onChange={(e) => setEdit({ ...edit, temperature: e.target.value })} placeholder="temp"
+                      style={{ width: 50, padding: '5px 7px', borderRadius: 7, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 11.5 }} />
+                    <input value={edit.extra} onChange={(e) => setEdit({ ...edit, extra: e.target.value })} placeholder='extra JSON'
+                      style={{ flex: 1, minWidth: 110, padding: '5px 7px', borderRadius: 7, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 11.5, fontFamily: T.mono }} />
+                  </div>
+                  <div style={{ display: 'flex', gap: 7, alignItems: 'center' }}>
+                    <button onClick={testEdit} style={{ padding: '6px 12px', borderRadius: 7, border: `1px solid ${T.border2}`, background: 'transparent', color: T.muted, fontSize: 11.5, fontWeight: 600, cursor: 'pointer' }}>Test</button>
+                    <button onClick={() => saveEdit(c)} style={{ padding: '6px 14px', borderRadius: 7, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 11.5, fontWeight: 700, cursor: 'pointer' }}>Save</button>
+                    {editMsg && <span style={{ fontSize: 11.5, color: editMsg.startsWith('✕') ? T.red : T.green, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{editMsg}</span>}
+                  </div>
+                </div>
+              )}
+              {r && r.status === 'failed' && (
+                <div onClick={(e) => e.stopPropagation()}
+                  style={{ marginTop: 8, padding: '9px 11px', borderRadius: 9, background: T.red + '14', border: `1px solid ${T.red}44` }}>
+                  <div style={{ fontSize: 11.5, color: T.red, fontWeight: 600, marginBottom: 3 }}>Why it failed</div>
+                  <div style={{ fontSize: 12, color: T.text3, lineHeight: 1.55, wordBreak: 'break-word' }}>
+                    {r.error_message || 'no error captured — check the run\u2019s progress log'}
+                  </div>
+                  <button
+                    onClick={async (e) => {
+                      e.stopPropagation()
+                      const btn = e.currentTarget; btn.disabled = true; btn.textContent = 'Relaunching\u2026'
+                      try { await api.retryArenaContestant(arena.id, r.id); location.reload() }
+                      catch { btn.disabled = false; btn.textContent = '\u21bb Retry this LLM' }
+                    }}
+                    style={{ marginTop: 8, padding: '6px 14px', borderRadius: 8, border: 'none', cursor: 'pointer',
+                             background: T.red, color: '#fff', fontSize: 12, fontWeight: 700 }}>
+                    ↻ Retry this LLM
+                  </button>
+                </div>
+              )}
               {r && ['optimizing', 'collecting'].includes(r.status) && (() => {
                 const a = arena.detail?.[c.run_id || '']?.activity
                 const phase = a?.phase === 'matrix' ? 'problem checks' : a?.phase === 'deep_confirm' ? 'deep-confirm' : a?.phase === 'confirm_convos' ? 'confirm convos' : a?.phase === 'stress' ? 'stress sims' : a?.phase === 'deepeval' ? 'deepeval' : a?.phase === 'conversations' ? 'conversations' : a?.phase === 'judging' ? 'judging' : null
@@ -510,13 +730,88 @@ function ArenaDetail({ id, nav }: { id: string; nav: (p: string) => void }) {
           <span style={{ fontSize: 18 }}>🏆</span>
           <span style={{ fontSize: 14, fontWeight: 700, color: T.text }}>{winner.label} wins</span>
           <span style={{ fontSize: 12.5, color: T.muted }}>
-            — best deepeval battery ({rankOf(winner)?.deepeval_avg}) on the same dataset with the same judge, first pass only
+            — best deepeval average ({rankOf(winner)?.deepeval_avg}) on the same dataset, same tools and same judge, first pass only
           </span>
         </div>
       )}
 
+      {/* TOOL CHECKS — same scripted situation, every LLM: does it CALL the tool? */}
+      {(() => {
+        const perTool: Record<string, Record<string, { verdict: string; called: number; n: number }>> = {}
+        cs.forEach((c) => {
+          const tc = arena.detail?.[c.run_id || '']?.tool_checks || {}
+          Object.entries(tc).forEach(([tool, r]) => {
+            if (tool === '_fixes') return
+            perTool[tool] = perTool[tool] || {}
+            perTool[tool][c.run_id || ''] = { verdict: r.verdict, called: r.called, n: r.n }
+          })
+        })
+        const tools = Object.keys(perTool).sort()
+        if (!tools.length) return null
+        const mark = (v?: string) => v === 'called' ? { t: '✓', c: T.green, l: 'calls it' }
+          : v === 'spoken_only' ? { t: '⚠', c: T.red, l: 'says the name only' }
+          : v === 'partial' ? { t: '~', c: T.amber, l: 'only some phrasings' }
+          : v === 'not_called' ? { t: '✕', c: T.red, l: 'never calls it' }
+          : { t: '—', c: T.fainter, l: 'not checked' }
+        return (
+          <>
+            <div style={{ ...label, margin: '20px 0 8px' }}>
+              Tool checks — the same scripted situation for every LLM
+            </div>
+            <div style={{ ...card, overflowX: 'auto' }}>
+              <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+                <thead>
+                  <tr>
+                    <th style={{ ...th, textAlign: 'left' }}>Tool</th>
+                    {cs.map((c) => (
+                      <th key={c.run_id} style={th}>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                          <span style={{ width: 8, height: 8, borderRadius: 99, background: colorOf(c) }} />{c.label}
+                        </span>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {tools.map((tool, ri) => (
+                    <tr key={tool} style={{ background: ri % 2 ? T.well : 'transparent' }}>
+                      <td style={{ padding: '5px 14px', fontFamily: T.mono, fontSize: 12, color: T.text3 }}>{tool}</td>
+                      {cs.map((c) => {
+                        const r = perTool[tool][c.run_id || '']
+                        const m = mark(r?.verdict)
+                        return (
+                          <td key={c.run_id} title={r ? `${m.l} · ${r.called}/${r.n} phrasings` : 'not checked'}
+                            style={{ padding: '5px 8px', textAlign: 'center' }}>
+                            <span style={{ color: m.c, fontWeight: 800, fontSize: 13 }}>{m.t}</span>
+                            {r && <span style={{ fontFamily: T.mono, fontSize: 10.5, color: T.fainter, marginLeft: 5 }}>{r.called}/{r.n}</span>}
+                          </td>
+                        )
+                      })}
+                    </tr>
+                  ))}
+                  <tr style={{ borderTop: `1px solid ${T.border2}` }}>
+                    <td style={{ padding: '7px 14px', fontSize: 12.5, fontWeight: 700, color: T.text }}>Tools called reliably</td>
+                    {cs.map((c) => {
+                      const tc = arena.detail?.[c.run_id || '']?.tool_checks || {}
+                      const vals = Object.entries(tc).filter(([k]) => k !== '_fixes').map(([, v]) => v)
+                      const good = vals.filter((r) => r.verdict === 'called').length
+                      return (
+                        <td key={c.run_id} style={{ padding: '7px 8px', textAlign: 'center', fontFamily: T.mono, fontWeight: 800, fontSize: 14,
+                                                    color: score100Color(vals.length ? (good / vals.length) * 100 : null) }}>
+                          {vals.length ? `${good}/${vals.length}` : '—'}
+                        </td>
+                      )
+                    })}
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </>
+        )
+      })()}
+
       {/* PRIMARY — deepeval battery */}
-      <div style={{ ...label, margin: '20px 0 8px' }}>Deepeval metrics — the primary signal (code-computed checks)</div>
+      <div style={{ ...label, margin: '20px 0 8px' }}>Deepeval metrics — the primary signal (judged rubrics + code-computed checks)</div>
       <div style={{ ...card, overflowX: 'auto' }}>
         <table style={{ borderCollapse: 'collapse', width: '100%' }}>
           <thead>
@@ -711,6 +1006,32 @@ function ArenaDetail({ id, nav }: { id: string; nav: (p: string) => void }) {
         </div>
       ) : (
         <div style={{ ...card, padding: 22, fontSize: 13, color: T.faint }}>First contestant is still being scored…</div>
+      )}
+
+      {arena.status === 'complete' && (
+        <div style={{ ...card, padding: '14px 16px', marginTop: 20 }}>
+          <div style={{ ...label, marginBottom: 4 }}>Change the judge & re-evaluate</div>
+          <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 10, lineHeight: 1.55 }}>
+            The {'\u2248'}{cs.length * 10} stored conversations are kept exactly as they are — only the problem
+            sweep and the metrics re-run under the judge you pick. The contestant models are never called again.
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+            <input value={rejudge.base_url} onChange={(e) => setRejudge({ ...rejudge, base_url: e.target.value })}
+              placeholder="judge base URL (…/v1)"
+              style={{ flex: 1, minWidth: 240, padding: '8px 11px', borderRadius: 9, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12.5, fontFamily: T.mono }} />
+            <input value={rejudge.model} onChange={(e) => setRejudge({ ...rejudge, model: e.target.value })}
+              placeholder="judge model id"
+              style={{ width: 220, padding: '8px 11px', borderRadius: 9, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12.5, fontFamily: T.mono }} />
+            <input value={rejudge.api_key} onChange={(e) => setRejudge({ ...rejudge, api_key: e.target.value })}
+              type="password" placeholder="API key (optional)"
+              style={{ width: 150, padding: '8px 11px', borderRadius: 9, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12.5 }} />
+            <button onClick={runReevaluate} disabled={rejudgeBusy}
+              style={{ padding: '9px 18px', borderRadius: 9, border: 'none', background: 'var(--accent)', color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer', opacity: rejudgeBusy ? 0.6 : 1 }}>
+              {rejudgeBusy ? 'Starting re-evaluation…' : 'Re-judge all conversations'}
+            </button>
+          </div>
+          {rejudgeMsg && <div style={{ marginTop: 8, fontSize: 12, color: T.red }}>{rejudgeMsg}</div>}
+        </div>
       )}
     </div>
   )

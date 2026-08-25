@@ -20,6 +20,7 @@ module.exports = (sequelize, DataTypes) =>
       statuses_json: { type: DataTypes.JSONB, allowNull: true },
       section_scores_json: { type: DataTypes.JSONB, allowNull: true },
       metrics_json: { type: DataTypes.JSONB, allowNull: true },
+      tool_checks_json: { type: DataTypes.JSONB, allowNull: true }, // {tool:{verdict,...}}
       latency_json: { type: DataTypes.JSONB, allowNull: true }, // {avg_ms,p50_ms,p99_ms,n_turns,detail}
       edits_json: { type: DataTypes.JSONB, allowNull: true },
       targeted_problem: { type: DataTypes.TEXT, allowNull: true },

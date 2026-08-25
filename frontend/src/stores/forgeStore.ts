@@ -34,6 +34,7 @@ export interface ForgeVersionRow {
   statuses_json: Record<string, { verdict: Verdict; evidence?: string }> | null
   section_scores_json: Record<string, number | null> | null
   metrics_json: Record<string, number | null> | null
+  tool_checks_json?: Record<string, { verdict: string; called: number; spoken_only: number; not_called: number; n: number }> | null
   edits_json: { op: string; path?: string; text?: string; find?: string; replace?: string }[] | null
   targeted_problem: string | null
   layer_for_fix: string | null

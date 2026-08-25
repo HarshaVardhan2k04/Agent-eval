@@ -3,6 +3,11 @@ from zoneinfo import ZoneInfo
 
 
 class ContextBuilder:
+    """Assembles the system prompt in PREFIX-CACHE order: the static base prompt
+    FIRST, the per-call dynamic context (time, lead, notes) LAST. vLLM's prefix
+    cache matches from token 0, so a dynamic header would make every call a
+    unique prefix and force a full prefill of the whole prompt each time."""
+
     def build(self, base_prompt, context_data):
         parts = []
 
@@ -49,4 +54,5 @@ class ContextBuilder:
             parts.append(f"**WHATSAPP CONVERSATION SUMMARY:**\n{lead['whatsapp_notes']}")
 
         context_block = "\n\n".join(parts)
-        return context_block + "\n\n" + base_prompt
+        # static base prompt first, per-call context appended (see class docstring)
+        return base_prompt + "\n\n" + context_block if context_block else base_prompt

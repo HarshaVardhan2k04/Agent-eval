@@ -4,7 +4,7 @@ import { T } from '../theme'
 import { ThemePicker } from './ThemePicker'
 import {
   IconHistory, IconPlus, IconAnalyze, IconBoard, IconStt, IconFlow,
-  IconTools, IconJudge, IconChevron, IconRag, IconSwords,
+  IconJudge, IconChevron, IconRag, IconSwords,
 } from './icons'
 
 type Item = { to: string; label: string; icon: (p: { s?: number }) => ReactNode; end?: boolean }
@@ -49,7 +49,6 @@ const GROUPS: Group[] = [
   {
     heading: 'Settings',
     items: [
-      { to: '/settings', label: 'Tools', icon: IconTools },
       { to: '/llm', label: 'Judge model', icon: IconJudge },
     ],
   },

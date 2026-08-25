@@ -36,7 +36,7 @@ def deep_merge(target: dict, source) -> dict:
     """Merge `source` into `target` in place (mirrors deepMerge)."""
     if not _is_plain_object(source):
         return target
-    for key in list(source.keys()):
+    for key in js_keys(source):
         if key.startswith("_"):  # metadata — never merged
             continue
         sv = source[key]
@@ -120,21 +120,71 @@ def _heading(depth: int) -> str:
     return "#" * min(max(depth, 1), 6)
 
 
+_UINT32_MAX = 2 ** 32 - 1
+
+
+def _is_array_index(key) -> bool:
+    """JS: a key is an integer index iff String(ToUint32(key)) === key."""
+    if not isinstance(key, str) or not key.isdigit():
+        return False
+    if len(key) > 1 and key[0] == "0":   # "01" is NOT canonical
+        return False
+    return int(key) < _UINT32_MAX
+
+
+def js_keys(obj: dict):
+    """Iterate keys the way JS `Object.keys` does: integer-like keys first, in
+    ascending numeric order, then the rest in insertion order. Python dicts are
+    strict insertion order, so a prompt with bare-digit keys ("1", "2", "10")
+    renders in a DIFFERENT order than production unless we reproduce this."""
+    keys = list(obj.keys())
+    idx = sorted((k for k in keys if _is_array_index(k)), key=int)
+    if not idx:
+        return keys
+    rest = [k for k in keys if not _is_array_index(k)]
+    return idx + rest
+
+
+def js_str(value) -> str:
+    """JS `String(value)` — production renders these scalars via Node, so a boolean
+    must read `true` (not Python's `True`), a null `null`, a whole float `3`, and a
+    nested array `x,y`. Without this the model literally sees different text."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, float):
+        if value != value:                      # NaN
+            return "NaN"
+        if value in (float("inf"), float("-inf")):
+            return "Infinity" if value > 0 else "-Infinity"
+        if value.is_integer() and abs(value) < 1e21:
+            return str(int(value))
+        return repr(value)
+    if isinstance(value, list):                 # JS Array.prototype.toString
+        return ",".join("" if v is None else js_str(v) for v in value)
+    if _is_plain_object(value):
+        return "[object Object]"
+    return str(value)
+
+
 def _emit_value(value, depth: int, lines: list) -> None:
     if isinstance(value, list):
         for item in value:
             if _is_plain_object(item):
                 _walk(item, depth, lines)
             else:
-                lines.append(f"- {item}")
+                lines.append(f"- {js_str(item)}")
     elif _is_plain_object(value):
         _walk(value, depth, lines)
     else:
-        lines.append(str(value))
+        lines.append(js_str(value))
 
 
 def _walk(obj: dict, depth: int, lines: list) -> None:
-    for key in obj.keys():
+    for key in js_keys(obj):
         if key.startswith("_"):
             continue
         lines.append("")

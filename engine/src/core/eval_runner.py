@@ -78,10 +78,12 @@ class EvalRunner:
 
         tool_simulator = None
         if config.get("tools_enabled"):
+            # Same default as Forge: every tool production can gate on. The core four
+            # are always-on inside ToolSimulator, so they aren't listed here.
             enabled_tools = config.get("enabled_tools", [
-                "end_call", "voicemail_detected", "warm_transfer_call",
-                "switch_agent", "search_knowledge_base", "send_whatsapp_template",
-                "date_calculator", "handle_call_screening", "irrelevant_interruption",
+                "warm_transfer_call", "switch_agent", "irrelevant_interruption",
+                "search_knowledge_base", "web_search", "send_whatsapp_template",
+                "get_location_details",
             ])
             tool_simulator = ToolSimulator(enabled_tools, rag_client)
 

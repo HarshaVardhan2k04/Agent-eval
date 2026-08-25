@@ -3,7 +3,8 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { T, card, label, verdictMeta } from '../../theme'
 import { api } from '../../api/client'
 import { useForgeStore } from '../../stores/forgeStore'
-import { RunStatusChip, LayerBadge, SolvedGauge, EscalationCard, VerdictCell } from '../../components/forge'
+import { RunStatusChip, LayerBadge, SolvedGauge, EscalationCard, VerdictCell,
+  ComboGate, CoachGuidancePanel, ComboScorecard } from '../../components/forge'
 
 type Ev = { id: number; event_type: string; event_data: Record<string, any>; created_at: string }
 
@@ -39,7 +40,17 @@ export function ForgeProgressPage() {
     return () => { alive = false; clearInterval(iv) }
   }, [id, fetchRun])
 
-  useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [events.length])
+  // Scroll the LOG's own container, not the page. scrollIntoView() moved the whole
+  // document, which yanked the page out from under anyone typing in the guidance box.
+  useEffect(() => {
+    const end = logEndRef.current
+    if (!end) return
+    let el: HTMLElement | null = end.parentElement
+    while (el && el.scrollHeight <= el.clientHeight) el = el.parentElement
+    if (el && el !== document.body && el !== document.documentElement) {
+      el.scrollTop = el.scrollHeight
+    }
+  }, [events.length])
 
   // derive live state from the event stream
   const live = useMemo(() => {
@@ -111,6 +122,32 @@ export function ForgeProgressPage() {
         v{run.current_version} · {run.mode} · {run.solved_pct != null ? `${run.solved_pct}% of ${denom ?? '—'} problems solved` : 'baseline running'} · gate {gate}%
       </p>
 
+      {run.status === 'awaiting_human' && ((run as any).combos_json?.blocked || []).length > 0 && (
+        <div style={{ marginTop: 18 }}>
+          <ComboGate runId={run.id}
+            blocked={(run as any).combos_json.blocked}
+            message={(run as any).combos_json.gate_message}
+            onResolved={() => window.location.reload()} />
+        </div>
+      )}
+
+      {((run as any).combos_json?.results || []).length > 0 && (
+        <div style={{ marginTop: 18 }}>
+          <ComboScorecard results={(run as any).combos_json.results}
+            overall={run.solved_pct ?? null} running={isLive}
+            allocation={(run as any).combos_json.allocation} />
+        </div>
+      )}
+
+      {run.status === 'failed' && (
+        <div style={{ marginTop: 14, padding: '11px 14px', borderRadius: 10, background: T.red + '14', border: `1px solid ${T.red}44` }}>
+          <div style={{ fontSize: 11.5, color: T.red, fontWeight: 700, marginBottom: 3 }}>Why it failed</div>
+          <div style={{ fontFamily: T.mono, fontSize: 12.5, color: T.text2, wordBreak: 'break-word' }}>
+            {run.error_message || 'no error captured'}
+          </div>
+        </div>
+      )}
+
       {/* escalations strip (park-and-continue) */}
       {openEsc.length > 0 && (
         <div style={{ marginTop: 18 }}>
@@ -128,6 +165,7 @@ export function ForgeProgressPage() {
       <div className="prog-grid" style={{ display: 'grid', gridTemplateColumns: '320px 1fr', gap: 18, marginTop: 20, alignItems: 'start' }}>
         {/* LEFT stack */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <CoachGuidancePanel runId={run.id} live={isLive} />
           <div style={{ ...card, padding: 16 }}>
             <div style={{ ...label, marginBottom: 10 }}>Current focus</div>
             {live.target ? (
@@ -228,7 +266,11 @@ function LogLine({ ev }: { ev: Ev }) {
       color = T.faint; text = `note: ${d.note}`; break
     case 'run_complete':
       color = d.status === 'llm_complete' ? T.green : T.amber2
-      text = `run complete · ${d.status} · ${d.solved_pct}% solved`; break
+      // a halted run has no score yet — "null% solved" reads like a bug, not a pause
+      text = d.status === 'needs_human_combo'
+        ? 'halted — waiting on your ruling for the invalid combo(s)'
+        : `run complete · ${d.status}${d.solved_pct != null ? ` · ${d.solved_pct}% solved` : ''}`
+      break
     default:
       color = T.fainter
   }

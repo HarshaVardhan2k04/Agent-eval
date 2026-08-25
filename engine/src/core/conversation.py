@@ -2,6 +2,7 @@ import re
 
 from src.config import DEFAULT_AGENT_TEMPERATURE, DEFAULT_USER_TEMPERATURE, DEFAULT_MAX_TOKENS
 from src.llm.prompts import USER_PERSONA_WRAPPER
+from src.tools import parser as tparse
 
 _THINK_TAG_RE = re.compile(r"<\s*think\s*>.*?</\s*think\s*>", re.DOTALL | re.IGNORECASE)
 _STRAY_TAG_RE = re.compile(r"<\s*/?\s*(?:think|thought|response)\s*>", re.IGNORECASE)
@@ -26,6 +27,13 @@ class ConversationEngine:
         msg = await client.chat(messages, tools=tools, temperature=temp, max_tokens=DEFAULT_MAX_TOKENS)
         return msg
 
+    def _leaks(self, transcript, tools_schema):
+        """Tool names the agent SPOKE instead of calling — recovered per conversation."""
+        offered = [t["function"]["name"] for t in (tools_schema or [])]
+        text = " ".join((t.get("content") or "") for t in (transcript or [])
+                        if t.get("role") in ("agent", "agent_end"))
+        return tparse.find_leaks(text, offered or None)
+
     def _fresh_tools(self):
         # New conversation → fresh per-call tool state (mirrors production's fresh
         # session userdata), then the schema list for the tools param.
@@ -36,7 +44,14 @@ class ConversationEngine:
 
     async def _handle_tool_calls(self, response, messages, tools_schema):
         tool_calls_made = []
+        rounds = 0
         while response.tool_calls:
+            # production reality: end_call deletes the room — NOTHING fires after it.
+            # Without this, a looping model can spam end_call 20+ times in one turn.
+            rounds += 1
+            if rounds > 5:
+                break
+            terminal = False
             for tc in response.tool_calls:
                 tool_result = await self.tool_simulator.execute(
                     tc.function.name, tc.function.arguments
@@ -46,9 +61,14 @@ class ConversationEngine:
                     "args": tc.function.arguments,
                     "result": tool_result,
                 })
+                # production deletes the room here — nothing else runs, and no further
+                # completion is requested. Break in the SAME round the call was made.
+                if tc.function.name in ("end_call", "voicemail_detected", "warm_transfer_call"):
+                    terminal = True
                 messages.append({
+                    # production omits "content" on a tool-call turn (see LiveKit
+                    # _provider_format/openai.py) — a chat template renders None otherwise
                     "role": "assistant",
-                    "content": None,
                     "tool_calls": [
                         {
                             "id": tc.id,
@@ -65,6 +85,8 @@ class ConversationEngine:
                     "tool_call_id": tc.id,
                     "content": str(tool_result),
                 })
+            if terminal:
+                break
             response = await self._llm_call(messages, tools=tools_schema)
         return response, tool_calls_made
 
@@ -103,7 +125,8 @@ class ConversationEngine:
                 {"role": "user", "content": scenario["question"]},
                 {"role": "agent", "content": agent_text,
                  "latency_ms": getattr(response, "latency_ms", None),
-                 "tokens": getattr(response, "completion_tokens", None)},
+                 "tokens": getattr(response, "completion_tokens", None),
+                 "ttft_ms": getattr(response, "ttft_ms", None)},
             ],
         }
 
@@ -134,7 +157,8 @@ class ConversationEngine:
             messages.append({"role": "assistant", "content": agent_text})
             transcript.append({"role": "agent", "content": agent_text,
                                "latency_ms": getattr(response, "latency_ms", None),
-                               "tokens": getattr(response, "completion_tokens", None)})
+                               "tokens": getattr(response, "completion_tokens", None),
+                 "ttft_ms": getattr(response, "ttft_ms", None)})
             all_tool_calls.extend(turn_tool_calls)
 
             turn_results.append({
@@ -172,7 +196,10 @@ class ConversationEngine:
         all_tool_calls = []
         call_ended = False
 
-        if call_direction == "outbound":
+        # A FOLLOW-UP is an outbound dial: we place the call, so the agent speaks the
+        # greeting first. Only a genuine inbound call has the lead speaking first.
+        agent_speaks_first = call_direction != "inbound"
+        if agent_speaks_first:
             # An EMPTY greeting must not become an empty assistant turn — some
             # providers (mistral via Io Net) 400 on empty assistant content + tools.
             if (greeting or "").strip():
@@ -197,7 +224,8 @@ class ConversationEngine:
             if agent_resp.tool_calls and self.tool_simulator:
                 # Production terminal tools: end_call and voicemail_detected both
                 # delete the room; the 4th irrelevant_interruption also hangs up.
-                if any(tc.function.name in ("end_call", "voicemail_detected") for tc in agent_resp.tool_calls):
+                if any(tc.function.name in ("end_call", "voicemail_detected", "warm_transfer_call")
+                       for tc in agent_resp.tool_calls):
                     call_ended = True
                 agent_resp, tc_made = await self._handle_tool_calls(agent_resp, agent_messages, tools_schema)
                 all_tool_calls.extend(tc_made)
@@ -207,7 +235,8 @@ class ConversationEngine:
             agent_messages.append({"role": "assistant", "content": agent_text})
             transcript.append({"role": "agent", "content": agent_text,
                                "latency_ms": getattr(agent_resp, "latency_ms", None),
-                               "tokens": getattr(agent_resp, "completion_tokens", None)})
+                               "tokens": getattr(agent_resp, "completion_tokens", None),
+                               "ttft_ms": getattr(agent_resp, "ttft_ms", None)})
             user_messages.append({"role": "user", "content": agent_text})
 
         for _ in range(max_turns):
@@ -232,7 +261,8 @@ class ConversationEngine:
             if agent_resp.tool_calls and self.tool_simulator:
                 # Production terminal tools: end_call and voicemail_detected both
                 # delete the room; the 4th irrelevant_interruption also hangs up.
-                if any(tc.function.name in ("end_call", "voicemail_detected") for tc in agent_resp.tool_calls):
+                if any(tc.function.name in ("end_call", "voicemail_detected", "warm_transfer_call")
+                       for tc in agent_resp.tool_calls):
                     call_ended = True
                 agent_resp, tc_made = await self._handle_tool_calls(agent_resp, agent_messages, tools_schema)
                 all_tool_calls.extend(tc_made)
@@ -242,7 +272,8 @@ class ConversationEngine:
             agent_messages.append({"role": "assistant", "content": agent_text})
             transcript.append({"role": "agent", "content": agent_text,
                                "latency_ms": getattr(agent_resp, "latency_ms", None),
-                               "tokens": getattr(agent_resp, "completion_tokens", None)})
+                               "tokens": getattr(agent_resp, "completion_tokens", None),
+                               "ttft_ms": getattr(agent_resp, "ttft_ms", None)})
             user_messages.append({"role": "user", "content": agent_text})
             if call_ended:
                 break
@@ -252,6 +283,8 @@ class ConversationEngine:
             "scenario_type": "simulated",
             "transcript": transcript,
             "tool_calls": all_tool_calls,
+            "tool_leaks": self._leaks(transcript, tools_schema),
+            "tools_offered": [t["function"]["name"] for t in (tools_schema or [])],
             "expected_outcome": scenario.get("expected_outcome"),
             "pass_criteria": scenario.get("pass_criteria"),
             "fail_criteria": scenario.get("fail_criteria"),

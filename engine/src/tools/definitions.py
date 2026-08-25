@@ -130,6 +130,11 @@ TOOL_DEFINITIONS = {
                             "- 'this weekend' or 'next weekend'\n"
                             "- 'next [weekday]' (e.g. 'next friday')\n"
                             "- 'this [weekday]' (e.g. 'this monday')\n"
+                            "- '[first|second|third|fourth|last] [weekday] of [month] [year]' "
+                            "(e.g. 'second saturday of september 2026'; year optional; "
+                            "also 'second saturday of next month')\n"
+                            "If the user gives an ordinal weekday WITHOUT any month "
+                            "(e.g. just 'the second Saturday'), do NOT guess — ask them which month they mean.\n"
                             "Examples: user says 'how about this coming Saturday' → pass 'this saturday'; "
                             "user says 'call me in a couple of days' → pass 'after 2 days'; "
                             "user says 'end of this month' → pass 'end of this month'."
@@ -242,11 +247,12 @@ TOOL_DEFINITIONS = {
                     },
                     "reason": {
                         "type": "string",
-                        "default": "",
                         "description": "One sentence explaining why the caller needs this agent.",
+                        "title": "Reason",
                     },
                 },
-                "required": ["target_agent_id"],
+                # production: the `= ""` default is lost by LiveKit -> reason is REQUIRED
+                "required": ["target_agent_id", "reason"],
             },
         },
     },
@@ -260,7 +266,26 @@ TOOL_DEFINITIONS = {
                 "- NEARBY: pass `source` + `nearby_type` to list real places (petrol pumps,\n"
                 "  schools, hospitals, landmarks, etc.) near a location.\n"
                 "Do NOT write the tool call as text or say the numbers before calling — call this\n"
-                "tool directly and use what it returns."
+                "tool directly and use what it returns.\n"
+                "ALWAYS call this tool when the caller asks how far a place is, which location is\n"
+                "nearest, or what is near a location — UNLESS your instructions already contain\n"
+                "that exact information; answer from your instructions first and only call for\n"
+                "what they do not cover. Never guess distances or nearby places yourself.\n"
+                "ALSO call this tool when the caller TELLS you where they live or are (in any\n"
+                "language, e.g. \'నేను సికింద్రాబాద్‌లో ఉంటా\' = \'I live in Secunderabad\') while\n"
+                "choosing between centers/branches — use DISTANCE mode: call once per center with\n"
+                "their location as source and that center\'s area as destination, then recommend\n"
+                "the nearest. Never use nearby_type for our own centers. Do not just repeat the\n"
+                "list of centers back.\n"
+                "Place names may be spoken in Telugu/Hindi — pass them in English letters\n"
+                "(\'సికింద్రాబాద్\' → \'Secunderabad, Hyderabad\').\n"
+                "For a distance question you need to know where the caller is — if they have not\n"
+                "said their location yet, ask them first instead of calling with a guess.\n"
+                "Callers speak casually over the phone: ignore filler words (\'uh\', \'like\') and fix\n"
+                "split or misheard place names (\'kukat pally\' → \'Kukatpally\') — if they named a\n"
+                "place in any form, that counts as their location, so call the tool.\n"
+                "Normalize what the caller said into clean args (each with the city), then call.\n"
+                "To compare several places, call once per place."
             ),
             "parameters": {
                 "type": "object",
@@ -310,3 +335,21 @@ TOOL_DEFINITIONS = {
         },
     },
 }
+
+
+def _ensure_titles():
+    """Pydantic emits a `title` for every property and a `<Camel>Args` title on the
+    parameters object; LiveKit passes that schema through untouched. Adding them here
+    keeps the mirrors byte-faithful without hand-writing 21 more keys."""
+    def camel(n):
+        return "".join(w.capitalize() for w in n.split("_")) + "Args"
+    def titlecase(n):
+        return " ".join(w.capitalize() for w in n.split("_"))
+    for name, d in TOOL_DEFINITIONS.items():
+        params = d["function"].setdefault("parameters", {"type": "object", "properties": {}})
+        params.setdefault("title", camel(name))
+        for pn, pv in (params.get("properties") or {}).items():
+            pv.setdefault("title", titlecase(pn))
+
+
+_ensure_titles()

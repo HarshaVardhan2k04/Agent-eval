@@ -12,12 +12,15 @@ module.exports = (sequelize, DataTypes) =>
       problem_id: { type: DataTypes.TEXT, allowNull: true },
       probe: { type: DataTypes.TEXT, allowNull: true },
       idx: { type: DataTypes.INTEGER, allowNull: true },
+      combo: { type: DataTypes.TEXT, allowNull: true },  // "outbound·fresh" — which cross-product cell
       transcript_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
       tool_calls_json: { type: DataTypes.JSONB, allowNull: true },
       ended: { type: DataTypes.BOOLEAN, allowNull: true },
       verdict: { type: DataTypes.TEXT, allowNull: true }, // pass | fail
       reason: { type: DataTypes.TEXT, allowNull: true },
       failing_turn: { type: DataTypes.INTEGER, allowNull: true },
+      tool_leaks_json: { type: DataTypes.JSONB, allowNull: true },     // spoken, never executed
+      tool_summary_json: { type: DataTypes.JSONB, allowNull: true },   // offered/fired/leaked/missed
       created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
     },
     {

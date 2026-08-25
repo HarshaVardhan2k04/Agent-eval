@@ -1,6 +1,6 @@
 // Shared Forge UI primitives — status chips, layer badges, verdict cells, gauges,
 // escalation cards, merged-preview panel. All built from the T tokens; no new deps.
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { T, card, label, forgeStatusMeta, verdictMeta } from '../theme'
 import { ScoreRing } from './analysis'
 import { api } from '../api/client'
@@ -130,6 +130,23 @@ export function EscalationCard({ esc, onAnswer }: { esc: ForgeEscalation; onAnsw
 export function MergedPreviewPanel({ markdown, greeting, flowStage, loading, error }: {
   markdown: string | null; greeting: string | null; flowStage: string | null; loading?: boolean; error?: string | null
 }) {
+  // live count of whatever the user highlights inside the preview — selection is a
+  // document-level event, so listen globally but only count text inside our pane.
+  const preRef = useRef<HTMLPreElement>(null)
+  const [selChars, setSelChars] = useState(0)
+  useEffect(() => {
+    const onSel = () => {
+      const sel = document.getSelection()
+      if (!sel || sel.isCollapsed || !preRef.current
+          || !preRef.current.contains(sel.anchorNode) || !preRef.current.contains(sel.focusNode)) {
+        setSelChars(0)
+        return
+      }
+      setSelChars(sel.toString().length)
+    }
+    document.addEventListener('selectionchange', onSel)
+    return () => document.removeEventListener('selectionchange', onSel)
+  }, [])
   return (
     <div style={{ ...card, overflow: 'hidden' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '11px 16px', borderBottom: `1px solid ${T.divider}`, flexWrap: 'wrap' }}>
@@ -145,17 +162,53 @@ export function MergedPreviewPanel({ markdown, greeting, flowStage, loading, err
             stage: {flowStage}
           </span>
         )}
-        {markdown && <span style={{ marginLeft: 'auto', fontSize: 11.5, color: T.faint, fontFamily: T.mono }}>{markdown.length.toLocaleString()} chars</span>}
+        {markdown && (
+          <span style={{ marginLeft: 'auto', fontSize: 11.5, color: T.faint, fontFamily: T.mono, display: 'inline-flex', gap: 10 }}>
+            {selChars > 0 && (
+              <span style={{ color: 'var(--accent)' }} title="the highlighted text">
+                selected {selChars.toLocaleString()} chars ≈ {estimateTokens(document.getSelection()?.toString() || '').toLocaleString()} tokens
+              </span>
+            )}
+            <span>{markdown.length.toLocaleString()} chars</span>
+            <span title="estimated — ~4 chars/token latin, ~2.2 non-latin">
+              ≈ {estimateTokens(markdown).toLocaleString()} tokens
+            </span>
+          </span>
+        )}
       </div>
       {error ? (
         <div style={{ padding: 16, fontSize: 13, color: T.amber }}>{error}</div>
       ) : markdown ? (
-        <pre style={{ margin: 0, padding: 16, maxHeight: 380, overflow: 'auto', background: T.well, fontSize: 11.5, lineHeight: 1.55, color: T.text3, fontFamily: T.mono, whiteSpace: 'pre-wrap' }}>
+        <pre ref={preRef} style={{ margin: 0, padding: 16, maxHeight: 380, overflow: 'auto', background: T.well, fontSize: 11.5, lineHeight: 1.55, color: T.text3, fontFamily: T.mono, whiteSpace: 'pre-wrap' }}>
           {markdown}
         </pre>
       ) : (
         <div style={{ padding: 20, fontSize: 13, color: T.faint }}>Pick / paste layers to see exactly what the voice agent will receive.</div>
       )}
+    </div>
+  )
+}
+
+// Size of a pasted prompt/dataset: characters plus an estimated token count.
+// Estimate, not a tokenizer: ~4 chars/token for latin text, ~2.2 for non-latin
+// (Devanagari/Telugu run far more tokens per character on Gemma's vocab).
+export function estimateTokens(text: string) {
+  if (!text) return 0
+  const nonLatin = (text.match(/[^\x00-\x7F]/g) || []).length
+  const latin = text.length - nonLatin
+  return Math.round(latin / 4 + nonLatin / 2.2)
+}
+
+export function SizeHint({ text, label: lbl, warnTokens }: { text: string; label?: string; warnTokens?: number }) {
+  const chars = text?.length || 0
+  const toks = estimateTokens(text || '')
+  const hot = warnTokens != null && toks > warnTokens
+  if (!chars) return <div style={{ fontSize: 11.5, color: T.fainter, marginTop: 6 }}>{lbl ? `${lbl} · ` : ''}empty</div>
+  return (
+    <div style={{ fontSize: 11.5, color: hot ? T.amber : T.faint, marginTop: 6, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+      <span>{lbl ? `${lbl} · ` : ''}{chars.toLocaleString()} chars</span>
+      <span title="estimated — ~4 chars/token latin, ~2.2 non-latin">≈ {toks.toLocaleString()} tokens</span>
+      {hot && <span>large prompt — first call pays a full prefill</span>}
     </div>
   )
 }
@@ -166,8 +219,113 @@ export type SimRow = {
   id: number; sim_uid: string; version: number; kind: string
   problem_id: string | null; probe: string | null; idx: number | null
   ended: boolean | null; verdict: string | null; reason: string | null
-  failing_turn: number | null; created_at: string; n_turns?: number
+  failing_turn: number | null; created_at: string; n_turns?: number; n_tools?: number
   transcript_json?: { role: string; content: string; latency_ms?: number | null; tokens?: number | null }[]
+  tool_calls_json?: { name: string; args?: string; result?: string; turn?: number }[] | null
+  tool_leaks_json?: { name: string; source?: string; snippet?: string; turn?: number }[] | null
+  tool_summary_json?: { offered?: string[]; fired?: string[]; unknown?: string[]; leaked?: string[]
+                        expected?: string[]; missed?: string[]; score?: number | null } | null
+  n_leaks?: number
+  check_verdict?: string | null   // toolcheck sims: called | spoken_only | not_called
+}
+
+// Footer strip under a conversation: which tools the model actually CALLED.
+// Click to expand each call's arguments and what the tool returned.
+export function ToolCallsStrip({ calls, leaks, summary }: {
+  calls?: SimRow['tool_calls_json']; leaks?: SimRow['tool_leaks_json']; summary?: SimRow['tool_summary_json']
+}) {
+  const [open, setOpen] = useState(false)
+  const list = calls || []
+  const leakList = leaks || []
+  const missed = summary?.missed || []
+  if (!list.length && !leakList.length && !missed.length) {
+    return (
+      <div style={{ marginTop: 12, fontSize: 11.5, color: T.fainter, borderTop: `1px solid ${T.divider}`, paddingTop: 9 }}>
+        No tools called in this conversation
+      </div>
+    )
+  }
+  const counts = list.reduce<Record<string, number>>((m, c) => ({ ...m, [c.name]: (m[c.name] || 0) + 1 }), {})
+  return (
+    <div style={{ marginTop: 12, borderTop: `1px solid ${T.divider}`, paddingTop: 9 }}>
+      <div onClick={() => setOpen((v) => !v)}
+        style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', cursor: 'pointer' }}>
+        <span style={{ fontSize: 10.5, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: T.muted }}>
+          Tools called ({list.length})
+        </span>
+        {Object.entries(counts).map(([name, n]) => (
+          <span key={name} style={{ padding: '2px 9px', borderRadius: 99, fontSize: 11, fontFamily: T.mono,
+                                    background: 'var(--accent)22', color: 'var(--accent)', border: `1px solid var(--accent)44` }}>
+            {name}{n > 1 ? ` ×${n}` : ''}
+          </span>
+        ))}
+        {leakList.map((l, i) => (
+          <span key={`lk${i}`} title="spoken as text — never executed"
+            style={{ padding: '2px 9px', borderRadius: 99, fontSize: 11, fontFamily: T.mono,
+                     background: T.red + '22', color: T.red, border: `1px solid ${T.red}55` }}>
+            {l.name} · spoken only
+          </span>
+        ))}
+        {missed.map((m) => (
+          <span key={`ms${m}`} title="expected for this scenario but never called"
+            style={{ padding: '2px 9px', borderRadius: 99, fontSize: 11, fontFamily: T.mono,
+                     background: T.amber + '22', color: T.amber, border: `1px solid ${T.amber}55` }}>
+            {m} · missed
+          </span>
+        ))}
+        {summary?.score != null && (
+          <span style={{ fontSize: 11, fontFamily: T.mono, color: summary.score >= 90 ? T.green : summary.score > 0 ? T.amber : T.red }}>
+            {summary.score}% executed
+          </span>
+        )}
+        <span style={{ fontSize: 11, color: T.fainter }}>{open ? '▾ hide details' : '▸ show arguments & results'}</span>
+      </div>
+      {open && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 7, marginTop: 9 }}>
+          {list.map((c, i) => {
+            const bad = String(c.result || '').startsWith('Unknown function')
+            return (
+              <div key={i} style={{ padding: '8px 11px', borderRadius: 9, background: T.well,
+                                    borderLeft: `3px solid ${bad ? T.red : T.green}` }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                  <span style={{ fontFamily: T.mono, fontSize: 12, fontWeight: 700, color: bad ? T.red : T.text2 }}>{c.name}</span>
+                  {c.turn != null && <span style={{ fontSize: 10.5, color: T.fainter }}>turn {c.turn}</span>}
+                  {bad && <span style={{ fontSize: 10.5, color: T.red }}>unknown / unavailable tool</span>}
+                </div>
+                {c.args && c.args !== '{}' && (
+                  <div style={{ fontFamily: T.mono, fontSize: 11.5, color: T.muted, marginTop: 4, wordBreak: 'break-word' }}>
+                    args: {c.args}
+                  </div>
+                )}
+                {c.result && (
+                  <div style={{ fontSize: 11.5, color: bad ? T.red : T.text3, marginTop: 4, wordBreak: 'break-word' }}>
+                    → {c.result}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+          {leakList.map((l, i) => (
+            <div key={`ld${i}`} style={{ padding: '8px 11px', borderRadius: 9, background: T.red + '10',
+                                         borderLeft: `3px solid ${T.red}` }}>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                <span style={{ fontFamily: T.mono, fontSize: 12, fontWeight: 700, color: T.red }}>{l.name}</span>
+                {l.turn != null && <span style={{ fontSize: 10.5, color: T.fainter }}>turn {l.turn}</span>}
+                <span style={{ fontSize: 10.5, color: T.red }}>
+                  spoken as text ({l.source}) — the tool never ran
+                </span>
+              </div>
+              {l.snippet && (
+                <div style={{ fontFamily: T.mono, fontSize: 11.5, color: T.muted, marginTop: 4, wordBreak: 'break-word' }}>
+                  “{l.snippet}”
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 // Full conversation as chat bubbles. failingTurn (transcript index) gets the red
@@ -213,7 +371,7 @@ export type SimRef = { sim_uid: string | null; reason?: string; failing_turn?: n
 export function ProofPanel({ runId, problemId, behaviour, verdictInfo, onClose }: {
   runId: string; problemId: string; behaviour: string
   verdictInfo?: { verdict?: string | null; evidence?: string; passes?: number; votes?: number
-                  sim_uids?: string[]; fails?: SimRef[] } | null
+                  sim_uids?: string[]; fails?: SimRef[]; source?: string } | null
   onClose: () => void
 }) {
   const [sims, setSims] = useState<SimRow[]>([])
@@ -270,7 +428,9 @@ export function ProofPanel({ runId, problemId, behaviour, verdictInfo, onClose }
         {/* reason banner */}
         <div style={{ padding: '10px 18px', background: (verdictInfo?.verdict === 'Y' ? T.green : T.red) + '14', borderBottom: `1px solid ${T.divider}`, fontSize: 12.5, color: T.text2 }}>
           <b style={{ color: verdictInfo?.verdict === 'Y' ? T.green : T.red }}>
-            {verdictInfo?.passes != null ? `${verdictInfo.passes}/${verdictInfo.votes} conversations passed` : 'verdict'}
+            {verdictInfo?.source === 'prompt_text'
+              ? 'Judged from the prompt text — no conversation needed'
+              : verdictInfo?.passes != null ? `${verdictInfo.passes}/${verdictInfo.votes} conversations passed` : 'verdict'}
           </b>
           {(active?.reason || failOf(active?.sim_uid)?.reason) && (
             <span style={{ color: T.muted }}> — {active?.reason || failOf(active?.sim_uid)?.reason}</span>
@@ -294,12 +454,264 @@ export function ProofPanel({ runId, problemId, behaviour, verdictInfo, onClose }
           )}
         </div>
         <div style={{ flex: 1, overflowY: 'auto', padding: 18 }}>
-          {active?.transcript_json
-            ? <SimTranscript transcript={active.transcript_json}
-                failingTurn={active.failing_turn ?? failOf(active.sim_uid)?.failing_turn} />
+          {verdictInfo?.source === 'prompt_text' ? (
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: T.muted, marginBottom: 8 }}>
+                What the judge found in the prompt
+              </div>
+              <div style={{ padding: '12px 14px', borderRadius: 10, background: T.well,
+                            borderLeft: `3px solid ${verdictInfo?.verdict === 'Y' ? T.green : T.red}`,
+                            fontSize: 13, lineHeight: 1.6, color: T.text2 }}>
+                {(verdictInfo.fails?.[0]?.reason || verdictInfo.evidence || 'no reason recorded')
+                  .replace(/^\d+\/\d+\s*/, '')}
+              </div>
+              <div style={{ fontSize: 11.5, color: T.fainter, marginTop: 10, lineHeight: 1.55 }}>
+                This problem is checked by reading the prompt itself (rule bloat, dangling flow
+                references, layer leaks) — it never runs a conversation, so there is nothing to replay here.
+              </div>
+            </div>
+          ) : active?.transcript_json
+            ? (<>
+                <SimTranscript transcript={active.transcript_json}
+                  failingTurn={active.failing_turn ?? failOf(active.sim_uid)?.failing_turn} />
+                <ToolCallsStrip calls={active.tool_calls_json} leaks={active.tool_leaks_json}
+                  summary={active.tool_summary_json} />
+              </>)
             : loading ? <div style={{ color: T.faint, fontSize: 13 }}>Loading…</div> : null}
         </div>
       </div>
     </>
+  )
+}
+
+// ---- direction x lead_status coverage ------------------------------------------------
+
+export type Combo = {
+  key: string; direction: string; lead_status: string | null
+  servable?: boolean; gap?: string | null; detail?: string | null; resolution?: string | null
+}
+export type ComboResult = {
+  key: string; solved_pct: number | null; composite: number | null
+  passed: boolean; n_sims: number
+}
+
+const DIR_COLOR: Record<string, string> = {
+  outbound: '#5ba3e0', inbound: '#5fc48f', followup: '#c79bf2',
+}
+
+export function ComboChip({ combo }: { combo: string }) {
+  const [dir, stage] = combo.split('·')
+  const col = DIR_COLOR[dir] || T.faint
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 5, padding: '2px 8px', borderRadius: 6,
+      background: col + '1f', color: col, fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap',
+    }}>
+      {dir}{stage ? <span style={{ opacity: 0.65 }}>· {stage}</span> : null}
+    </span>
+  )
+}
+
+/** Per-combo scorecard + the pooled overall. Every combo must pass the gate — one weak
+ *  stage cannot be averaged away by the strong ones, so failures are listed first. */
+export function ComboScorecard({ results, overall, gatePct = 95, allocation, running, onPick }: {
+  results: ComboResult[]; overall: number | null; gatePct?: number
+  allocation?: { per_combo: number; total: number; dropped: number; capped: boolean; cap: number } | null
+  running?: boolean
+  onPick?: (key: string) => void
+}) {
+  if (!results?.length) return null
+  const failing = results.filter((r) => !r.passed)
+  const sorted = [...results].sort((a, b) => (a.passed === b.passed ? 0 : a.passed ? 1 : -1))
+  return (
+    <div style={{ ...card, padding: 18 }}>
+      <div style={{ display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', marginBottom: 4 }}>
+        <div style={label}>
+          Coverage · {results.length}{running && allocation ? ` of ${Math.round(allocation.total / Math.max(allocation.per_combo, 1))}` : ''} combos
+        </div>
+        <div style={{ fontSize: 12, color: failing.length ? T.red : T.green, fontWeight: 600 }}>
+          {/* mid-run this is a running tally, not a verdict — say so, or a run that has
+              only scored its first combo reads as if it already failed */}
+          {failing.length
+            ? `${failing.length} combo${failing.length > 1 ? 's' : ''} below gate${running ? ' so far' : ''}`
+            : running ? `${results.length} scored so far` : 'every combo passed'}
+        </div>
+      </div>
+      <div style={{ fontSize: 12, color: T.faint, marginBottom: 14 }}>
+        The gate requires <b>every</b> combo to reach {gatePct}% independently.
+        {allocation?.capped ? ` Capped at ${allocation.cap} conversations — ${allocation.per_combo} personas per combo, ${allocation.dropped} dropped.` : null}
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '10px 12px', marginBottom: 10,
+        background: T.surface2, borderRadius: 8 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.muted, minWidth: 70 }}>OVERALL</div>
+        <div style={{ fontSize: 20, fontWeight: 700, color: overall == null ? T.faint : (failing.length ? T.red : T.green) }}>
+          {overall == null ? '—' : `${overall}%`}
+        </div>
+        <div style={{ fontSize: 11, color: T.faint }}>
+          pooled — a problem counts solved only if it never occurred in any combo
+        </div>
+      </div>
+
+      {sorted.map((r) => (
+        <div key={r.key} onClick={() => onPick?.(r.key)}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 12, padding: '9px 12px',
+            borderLeft: `3px solid ${r.passed ? T.green : T.red}`, borderRadius: 6,
+            marginBottom: 5, background: T.surface2 + '80', cursor: onPick ? 'pointer' : 'default',
+          }}>
+          <div style={{ minWidth: 160 }}><ComboChip combo={r.key} /></div>
+          <div style={{ fontSize: 15, fontWeight: 700, color: r.passed ? T.green : T.red, minWidth: 58 }}>
+            {r.solved_pct == null ? '—' : `${r.solved_pct}%`}
+          </div>
+          <div style={{ fontSize: 12, color: T.faint, minWidth: 90 }}>
+            {r.composite == null ? '' : `composite ${r.composite}`}
+          </div>
+          <div style={{ fontSize: 11, color: T.faint }}>{r.n_sims} conversations</div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** The human gate. The prompt cannot serve these combos, so the run HALTED rather than
+ *  testing a prompt production would never send. Nothing resumes until every gap is ruled on. */
+export function ComboGate({ runId, blocked, message, onResolved }: {
+  runId: string; blocked: Combo[]; message?: string; onResolved: () => void
+}) {
+  const [answers, setAnswers] = useState<Record<string, { action: string; text: string }>>(
+    () => Object.fromEntries(blocked.map((b) => [b.key, { action: 'content', text: '' }])))
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState<string | null>(null)
+
+  const incomplete = blocked.filter((b) => {
+    const a = answers[b.key]
+    return !a || (a.action === 'content' && !a.text.trim())
+  })
+
+  async function submit() {
+    setBusy(true); setErr(null)
+    try {
+      await api.forgeResolveCombos(runId, answers)
+      onResolved()
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) }
+    finally { setBusy(false) }
+  }
+
+  return (
+    <div style={{ ...card, padding: 20, borderLeft: `3px solid ${T.amber}` }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 9, marginBottom: 6 }}>
+        <span style={{ fontSize: 16 }}>⏸</span>
+        <div style={{ fontSize: 14, fontWeight: 700, color: T.amber }}>RUN HALTED — invalid combos</div>
+      </div>
+      <div style={{ fontSize: 12.5, color: T.muted, marginBottom: 16, lineHeight: 1.55 }}>
+        {message || `${blocked.length} combo(s) cannot be served by this prompt.`} Guessing would test a
+        prompt production never sends, so nothing runs until you rule on each one. Whatever you write is
+        merged in for real <i>and</i> handed to the coach as a hole it must fix in the prompt itself.
+      </div>
+
+      {blocked.map((b) => {
+        const a = answers[b.key] || { action: 'content', text: '' }
+        const set = (patch: Partial<{ action: string; text: string }>) =>
+          setAnswers((p) => ({ ...p, [b.key]: { ...a, ...patch } }))
+        return (
+          <div key={b.key} style={{ marginBottom: 18, padding: 14, background: T.surface2, borderRadius: 8 }}>
+            <div style={{ marginBottom: 6 }}><ComboChip combo={b.key} /></div>
+            <div style={{ fontSize: 12, color: T.faint, marginBottom: 11, lineHeight: 1.5 }}>{b.detail}</div>
+            <div style={{ display: 'flex', gap: 16, marginBottom: 10, flexWrap: 'wrap' }}>
+              {[
+                ['content', b.gap?.startsWith('no_stage') ? 'Write the flow stage' : 'Write the greeting'],
+                ['fallback', 'Fall back to outbound'],
+                ['skip', 'Skip this combo (N/A)'],
+              ].map(([val, lbl]) => (
+                <label key={val} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5,
+                  color: a.action === val ? T.text : T.muted, cursor: 'pointer' }}>
+                  <input type="radio" checked={a.action === val} onChange={() => set({ action: val })} />
+                  {lbl}
+                </label>
+              ))}
+            </div>
+            {a.action === 'content' ? (
+              <>
+                <textarea value={a.text} onChange={(e) => set({ text: e.target.value })}
+                  placeholder={`e.g. Hi <name>, this is Priya calling back about the site visit we discussed…`}
+                  rows={3} style={{
+                    width: '100%', background: T.well, color: T.text, border: `1px solid ${T.border2}`,
+                    borderRadius: 6, padding: 10, fontSize: 12.5, fontFamily: 'inherit', resize: 'vertical',
+                  }} />
+                <div style={{ fontSize: 11, color: T.faint, marginTop: 4 }}>
+                  <code>&lt;name&gt;</code> is substituted with the lead's name, exactly as production does.
+                </div>
+              </>
+            ) : null}
+          </div>
+        )
+      })}
+
+      {err ? <div style={{ fontSize: 12, color: T.red, marginBottom: 10 }}>{err}</div> : null}
+      <button disabled={busy || incomplete.length > 0} onClick={submit}
+        style={{
+          padding: '9px 18px', borderRadius: 7, border: 'none', fontSize: 13, fontWeight: 600,
+          background: incomplete.length ? T.border2 : T.accent, color: incomplete.length ? T.faint : '#111',
+          cursor: incomplete.length || busy ? 'not-allowed' : 'pointer',
+        }}>
+        {busy ? 'Resuming…' : incomplete.length ? `${incomplete.length} still unanswered` : 'Save & resume run'}
+      </button>
+    </div>
+  )
+}
+
+/** Operator's standing instructions to the coach for THIS run. Editable while the run is
+ *  going — the engine re-reads it before every proposal, so it lands on the next iteration. */
+export function CoachGuidancePanel({ runId, live }: { runId: string; live?: boolean }) {
+  const [text, setText] = useState('')
+  const [saved, setSaved] = useState('')
+  const [state, setState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle')
+
+  useEffect(() => {
+    let dead = false
+    api.forgeCoachGuidance(runId)
+      .then((r) => { if (!dead) { setText(r.coach_guidance || ''); setSaved(r.coach_guidance || '') } })
+      .catch(() => {})
+    return () => { dead = true }
+  }, [runId])
+
+  const dirty = text !== saved
+  async function save() {
+    setState('saving')
+    try {
+      await api.forgeSetCoachGuidance(runId, text)
+      setSaved(text); setState('saved')
+    } catch { setState('error') }
+  }
+
+  return (
+    <div style={{ ...card, padding: 16 }}>
+      <div style={label}>Coach guidance</div>
+      <div style={{ fontSize: 11.5, color: T.faint, margin: '5px 0 10px', lineHeight: 1.5 }}>
+        Anything specific you want the coach to do — style, wording, things to never say.
+        {live ? ' Editable mid-run: the coach picks it up on the next iteration.' : null}
+      </div>
+      <textarea value={text} onChange={(e) => { setText(e.target.value); setState('idle') }}
+        rows={6} placeholder={"Never use the word 'sir'.\nKeep replies under 2 lines.\nSay 'square feet', never 'sqft'."}
+        style={{
+          width: '100%', background: T.surface2, color: T.text, border: `1px solid ${T.border2}`,
+          borderRadius: 6, padding: 10, fontSize: 12.5, fontFamily: 'inherit', resize: 'vertical',
+        }} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8 }}>
+        <button disabled={!dirty || state === 'saving'} onClick={save}
+          style={{
+            padding: '6px 14px', borderRadius: 6, border: 'none', fontSize: 12, fontWeight: 600,
+            background: dirty ? T.accent : T.border2, color: dirty ? '#111' : T.faint,
+            cursor: dirty ? 'pointer' : 'default',
+          }}>
+          {state === 'saving' ? 'Saving…' : 'Save'}
+        </button>
+        <span style={{ fontSize: 11, color: state === 'error' ? T.red : T.faint }}>
+          {state === 'error' ? 'save failed' : state === 'saved' && !dirty ? 'saved — applies from the next iteration' : ''}
+        </span>
+        <SizeHint text={text} />
+      </div>
+    </div>
   )
 }

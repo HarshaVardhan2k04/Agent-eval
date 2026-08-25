@@ -7,13 +7,13 @@ export const SECTION_LABELS: Record<string, string> = {
   information_push_goal: 'Information & goal progression',
   conversation_management_flow: 'Conversation management / flow',
   call_closing: 'Call closing',
-  tool_calling: 'Tool-calling',
+  tool_calling: 'Tool use (judged)',
 }
 export const METRIC_LABELS: Record<string, string> = {
   customer_retention_frustration: 'Retention / calm',
   repetition: 'Avoids repetition',
   instruction_flow_following: 'Follows instructions & flow',
-  tool_calling: 'Tool-calling',
+  tool_calling: 'Tool-calling (code)',
   human_likeness: 'Human-likeness',
   faithfulness: 'Faithfulness',
   answer_relevancy: 'Answered the question',

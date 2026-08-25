@@ -33,6 +33,15 @@ function evaluateOnly(runId, spec, config = {}) {
   });
 }
 
+function regradeForge(runId, spec, config = {}) {
+  return post('/api/forge/regrade', {
+    run_id: runId,
+    spec,
+    config,
+    callback_url: `${selfUrl}/api/internal/forge-events`,
+  });
+}
+
 async function stopForge(runId) {
   const res = await fetch(`${engineUrl}/api/forge/${runId}/stop`, { method: 'POST' });
   if (!res.ok) throw new Error(`Engine error: ${res.status} ${await res.text()}`);
@@ -47,4 +56,4 @@ function chatTurn(runId, body) {
   return post(`/api/forge/${runId}/chat`, body);
 }
 
-module.exports = { dispatchForge, evaluateOnly, stopForge, mergePreview, chatTurn };
+module.exports = { dispatchForge, evaluateOnly, regradeForge, stopForge, mergePreview, chatTurn };

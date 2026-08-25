@@ -28,8 +28,11 @@ import httpx
 from src.llm.client import LLMClient
 from src.core.conversation import ConversationEngine
 from src.tools.simulator import ToolSimulator
+from src.tools import parser as tparse
+from src.forge import toolchecks as tchecks
 from src.analysis.evaluator import CallEvaluator
 from src.forge import merge as fmerge
+from src.forge import combos as fcombo
 from src.forge import detectors as fdet
 from src.forge import stress as fstress
 from src.forge import verify as fverify
@@ -66,10 +69,63 @@ class EventBus:
             self._listeners.remove(q)
 
 
-def _wrap(markdown, direction, lead_status):
-    return (f"**LEAD INFORMATION:**\nCall Direction: {direction}\nLead Status: {lead_status}\n\n"
-            f"**AGENT INSTRUCTIONS:**\n{markdown}\n\n"
-            f"**CALL TRANSFER CAPABILITY:**\nTransfer to the team for a callback.")
+def _pooled_tool_calling(sims):
+    """Total VALID tool calls / total attempts across every conversation.
+
+    A conversation-level median answers "what does a typical call look like?";
+    the question that matters for tools is "does this agent ever fail to act?".
+    One leaked end_call in fifteen calls must move the number — with a median it
+    doesn't move until half the calls fail. Returns None when nothing was attempted
+    anywhere (nothing to judge), which keeps the metric out of arena averages.
+    """
+    valid = attempts = 0
+    for sim in (sims or []):
+        for c in (sim.get("tool_calls") or []):
+            attempts += 1
+            if not str(c.get("result", "")).startswith("Unknown function"):
+                valid += 1
+        attempts += len(sim.get("tool_leaks") or [])   # spoken, never executed
+    return round(100.0 * valid / attempts, 1) if attempts else None
+
+
+def _pooled_from_probe_results(results):
+    """Same pooling for the optimizer path, where score_probe already returned the
+    per-rollout tool records and any spoken-tool leaks."""
+    valid = attempts = 0
+    for r in (results or []):
+        for calls in (r.get("all_tool_calls") or []):
+            for c in (calls or []):
+                attempts += 1
+                if not str(c.get("result", "")).startswith("Unknown function"):
+                    valid += 1
+        attempts += len(r.get("spoken_tool_leaks") or [])
+    return round(100.0 * valid / attempts, 1) if attempts else None
+
+
+def _wrap(markdown, direction, lead_status, lead=None):
+    """Assemble the system prompt in PREFIX-CACHE order: the big STATIC blocks first,
+    the tiny per-call dynamic block LAST.
+
+    vLLM matches its prefix/KV cache token-by-token from position 0. With the
+    lead header on top, every conversation diverged within ~15 tokens and paid a
+    full prefill of the whole prompt; with it at the bottom, all conversations of
+    a run share one cached prefix and only the short tail is prefilled.
+
+    NOTE this is deliberately NOT production's full 10-block layout (see
+    docs/FORGE_COMBO_MATRIX.md, "KNOWN, ACCEPTED divergence"). The LEAD INFORMATION
+    block is enriched per combo; no other block is added.
+    """
+    lines = []
+    if lead and lead.get("name"):
+        lines.append(f"Customer Name: {lead['name']}")
+    lines.append(f"Call Direction: {direction}")
+    lines.append(f"Lead Status: {lead_status}")
+    if lead and lead.get("followup_reason"):
+        lines.append(f"Reason for follow-up: {lead['followup_reason']}")
+    lead_block = "\n".join(lines)
+    return (f"**AGENT INSTRUCTIONS:**\n{markdown}\n\n"
+            f"**CALL TRANSFER CAPABILITY:**\nTransfer to the team for a callback.\n\n"
+            f"**LEAD INFORMATION:**\n{lead_block}")
 
 
 class ForgeRunner:
@@ -100,7 +156,7 @@ class ForgeRunner:
         # date_calculator) are always on inside ToolSimulator — this list is the
         # GATED extras, mirroring production's available_tools metadata.
         tools = ToolSimulator(config.get("enabled_tools") or [
-            "warm_transfer_call", "search_knowledge_base",
+            "warm_transfer_call", "search_knowledge_base", "send_whatsapp_template",
         ]) if config.get("tools_enabled", True) else None
         self.engine = ConversationEngine(self.agent_llm, tools, None, user_llm=self.judge_llm)
         self.evaluator = CallEvaluator(self.judge_llm)
@@ -109,26 +165,157 @@ class ForgeRunner:
     def stop(self):
         self._stopped = True
 
+    async def _run_tool_checks(self, system_prompt, greeting, only=None):
+        """One scripted conversation per enabled tool (x2 phrasings): does the model
+        actually CALL the tool when the situation demands it? Emits each conversation
+        as a stored sim (kind='toolcheck') and returns the per-tool roll-up."""
+        sim = self.engine.tool_simulator
+        if not sim:
+            return {}
+        import uuid as _uuid
+        enabled = list(getattr(sim, "enabled_tools", []) or [])
+        if only:
+            enabled = [t for t in enabled if t in set(only)]
+        plan = tchecks.checks_for(enabled)
+        results = []
+        total = len(plan)
+        for i, (tool, variant, lines, note) in enumerate(plan):
+            if self._stopped:
+                break
+            sim.reset_conversation()
+            try:
+                convo, ended, meta = await fdet._drive(
+                    self.engine.llm, system_prompt, greeting, lines, tools_on=True, tool_sim=sim)
+            except Exception as e:
+                await self.bus.emit("iteration_note", {"run_id": self.run_id, "attempt": 0,
+                                    "note": f"tool check {tool} errored: {str(e)[:80]}"})
+                continue
+            calls = (meta or {}).get("tool_calls") or []
+            leaks = (meta or {}).get("tool_leaks") or []
+            v = tchecks.verdict(tool, calls, leaks)
+            results.append((tool, v))
+            uid = f"{self.run_id[:8]}-tchk-{tool[:12]}-{variant}-{_uuid.uuid4().hex[:5]}"
+            await self.bus.emit("sim_recorded", {
+                "run_id": self.run_id, "sim_uid": uid, "kind": "toolcheck",
+                "probe": f"{tool} · {note}", "idx": variant, "version": self._cur_version,
+                "ended": ended is not None,
+                "transcript": fdet.convo_to_transcript(convo, meta),
+                "tool_calls": calls, "tool_leaks": leaks,
+                "tool_summary": {**self._tool_summary(calls, leaks, [tool]), "check_verdict": v,
+                                 "check_tool": tool},
+            })
+            await self.bus.emit("progress", {"run_id": self.run_id, "phase": "tool_checks",
+                                             "done": i + 1, "total": total, "probe": tool,
+                                             "verdict": v})
+        return tchecks.roll_up(results)
+
+    async def _fix_tool_calls(self, mode, champion, tool_checks, sp, greeting,
+                              direction, lead_status, max_fixes=3):
+        """Coach the prompt until the failing tools actually FIRE.
+
+        A tool check that fails is the cleanest possible optimization target: the
+        situation is scripted, the desired action is unambiguous, and the proven
+        lever is already written down (toolchecks.TOOL_LEVERS). So for each failing
+        tool we hand the coach the failure + the lever, apply its edit, and RE-RUN
+        that tool's checks — keeping the edit only if the tool starts firing.
+        Returns (champion, tool_checks, applied_fixes).
+        """
+        applied = []
+        for tool, roll in tchecks.failing(tool_checks)[:max_fixes]:
+            if self._stopped:
+                break
+            problem = tchecks.as_coach_problem(tool, roll)
+            await self.bus.emit("iteration_note", {
+                "run_id": self.run_id, "attempt": 0,
+                "note": f"coaching {tool}: {roll.get('verdict')} ({roll.get('called', 0)}/{roll.get('n', 0)} phrasings)"})
+            try:
+                decision = await self.coach.propose(
+                    mode=mode, problem=problem,
+                    current_prompt=(champion.get("blob") if mode == "standalone" else None),
+                    layers=champion.get("layers"),
+                    guidance=("This is a TOOL-CALLING failure, not a wording problem. The fix must make "
+                              "the model actually invoke the tool in that situation. Apply the lever."))
+            except Exception as e:
+                await self.bus.emit("iteration_note", {"run_id": self.run_id, "attempt": 0,
+                                    "note": f"coach errored on {tool}: {str(e)[:80]}"})
+                continue
+            if decision.get("escalate") or decision.get("needs_human"):
+                continue                      # shared-layer edits stay human-gated
+            cand, n_applied = self._apply_fix(mode, champion, decision)
+            if not n_applied:
+                continue
+            csp, ccfg, cgreet = self._build_prompt(mode, cand, direction, lead_status)
+            after = await self._run_tool_checks(csp, cgreet, only=[tool])
+            before_v = (roll or {}).get("verdict")
+            after_v = (after.get(tool) or {}).get("verdict")
+            kept = after_v == tchecks.CALLED
+            await self.bus.emit("iteration_note", {
+                "run_id": self.run_id, "attempt": 0,
+                "note": (f"{tool}: {before_v} -> {after_v} — "
+                         + ("edit KEPT" if kept else "edit reverted, tool still not firing"))})
+            if kept:
+                champion = cand
+                tool_checks = {**tool_checks, tool: after[tool]}
+                sp, greeting = csp, cgreet
+                applied.append({"tool": tool, "from": before_v, "to": after_v,
+                                "summary": decision.get("changes_summary"),
+                                "edits": decision.get("edits")})
+        return champion, tool_checks, applied, sp, greeting
+
+    def _tool_summary(self, calls, leaks, expected=None):
+        """Per-conversation tool verdict: offered / fired / leaked / unknown / missed."""
+        offered = (list(getattr(self.engine.tool_simulator, "enabled_tools", []) or [])
+                   if self.engine.tool_simulator else [])
+        return tparse.summarize(offered, calls, leaks, expected)
+
+    async def _coach_guidance(self, spec):
+        """The operator's live guidance for this run.
+
+        The engine receives `spec` once at dispatch, but the guidance panel is edited
+        WHILE the run is going — so re-read it from the backend before each proposal and
+        fall back to whatever the spec was launched with."""
+        fallback = spec.get("coach_guidance") or ""
+        url = self.bus.callback_url
+        if not url:
+            return fallback
+        base = url.split("/api/")[0]
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                r = await client.get(f"{base}/api/internal/forge/{self.run_id}/coach-guidance")
+                if r.status_code == 200:
+                    return (r.json() or {}).get("coach_guidance") or fallback
+        except Exception:
+            pass          # a guidance fetch must never be able to kill a run
+        return fallback
+
     # ---- prompt building ----------------------------------------------------
-    def _build_prompt(self, mode, champion, direction, lead_status):
+    def _build_prompt(self, mode, champion, direction, lead_status, lead=None,
+                      greeting_override=None):
         """Return (system_prompt, config_for_scorer, greeting)."""
         if mode == "layered":
             rows = []
             for lt in ("universal", "vertical", "campaign"):
                 layer = champion["layers"].get(lt)
-                if layer:
-                    rows.append({"prompt_type": lt, "prompt": layer,
-                                 "override_keys": champion.get("override_keys", {}).get(lt, [])})
+                if not layer:
+                    continue
+                oks = champion.get("override_keys", {}).get(lt, [])
+                # production allows N prompt rows per layer type; accept a list too
+                for one in (layer if isinstance(layer, list) else [layer]):
+                    if one:
+                        rows.append({"prompt_type": lt, "prompt": one, "override_keys": oks})
             addons = champion["layers"].get("addon") or []
             res = fmerge.assemble_for_forge(rows, addons, call_direction=direction, lead_status=lead_status)
-            return _wrap(res["markdown"], direction, lead_status), res["merged_full"], res["greeting"]
+            # a human-authored greeting for a combo the prompt could not serve
+            greeting = greeting_override or res["greeting"]
+            return (_wrap(res["markdown"], direction, lead_status, lead),
+                    res["merged_full"], greeting)
         # standalone
         blob = champion["blob"]
         if isinstance(blob, dict):
             # a structured editable_config — render a readable system prompt, score on the dict
             md = fmerge.render_markdown(blob)
-            return _wrap(md, direction, lead_status), blob, ""
-        return _wrap(str(blob), direction, lead_status), {}, ""
+            return _wrap(md, direction, lead_status, lead), blob, (greeting_override or "")
+        return _wrap(str(blob), direction, lead_status, lead), {}, (greeting_override or "")
 
     def _apply_fix(self, mode, champion, decision):
         """Apply the coach's edits run-local. Returns (new_champion, applied)."""
@@ -166,11 +353,14 @@ class ForgeRunner:
                 if self._stopped:
                     return None
                 try:
-                    convo, ended, meta = await fdet.drive_scenario(self.engine, system_prompt, greeting, pid)
+                    # vote k uses variant k — different phrasing of the same situation
+                    convo, ended, meta = await fdet.drive_scenario(
+                        self.engine, system_prompt, greeting, pid, variant=k)
                 except Exception as e:
                     convo, ended, meta = [("A", greeting or ""), ("L", f"[generation error: {str(e)[:60]}]")], None, {}
                 uid = f"{self.run_id[:8]}-{kind[:4]}-{pid}-{k}-{_uuid.uuid4().hex[:6]}"
-                return {"sim_uid": uid, "pid": pid, "idx": k, "convo": convo, "ended": ended, "meta": meta}
+                return {"sim_uid": uid, "pid": pid, "idx": k, "convo": convo, "ended": ended,
+                        "meta": meta, "tool_calls": (meta or {}).get("tool_calls") or []}
 
         tasks = [one(pid, k) for pid in convo_pids for k in range(votes)]
         n_errors = 0
@@ -187,6 +377,7 @@ class ForgeRunner:
                 "problem_id": sim["pid"], "idx": sim["idx"], "version": self._cur_version,
                 "ended": sim["ended"] is not None,
                 "transcript": fdet.convo_to_transcript(sim["convo"], sim.get("meta")),
+                "tool_calls": sim.get("tool_calls") or [],
             })
             await self.bus.emit("progress", {"run_id": self.run_id,
                                              "phase": "confirm_convos" if kind == "deep_confirm" else "conversations",
@@ -244,7 +435,7 @@ class ForgeRunner:
                 ok, ev, _ft = await fdet._prompt_judge(judge, system_prompt, fdet.PROMPT_JUDGE_DETECTORS[pid])
                 passes = votes if ok else 0
                 out[pid] = {"verdict": fdet.verdict_from_votes(passes, votes), "passes": passes,
-                            "votes": votes, "evidence": f"{passes}/{votes} {ev}", "sim_uids": [],
+                            "votes": votes, "evidence": ev, "sim_uids": [], "source": "prompt_text",
                             "fails": ([] if ok else [{"sim_uid": None, "reason": ev, "failing_turn": None}])}
         return out
 
@@ -308,8 +499,35 @@ class ForgeRunner:
             except Exception as e:
                 res = {"composite_score": None, "sections": {}, "metrics": {},
                        "gated_reason": f"score_error: {str(e)[:80]}"}
-            if not (sim.get("fired") or sim["ended"]) and isinstance(res.get("metrics"), dict):
-                res["metrics"]["tool_calling"] = None  # nothing fired -> not judgeable
+            if isinstance(res.get("metrics"), dict):
+                # tool_calling is CODE-COMPUTED call QUALITY, not volume. A call is BAD if:
+                #  - unknown/unavailable tool (hallucinated)
+                #  - identical duplicate within the same conversation (spam loop)
+                #  - voicemail_detected after the "machine" already spoke like a human
+                #  - a tool name SPOKEN instead of called (recovered by the parser) — the
+                #    model believed it acted; nothing executed
+                calls = sim.get("tool_calls") or []
+                leaks = sim.get("tool_leaks") or []
+                summ = self._tool_summary(calls, leaks, sim.get("expected_tools"))
+                if summ["attempts"] == 0:
+                    res["metrics"]["tool_calling"] = None  # nothing attempted -> not judgeable
+                else:
+                    user_turns = sum(1 for t in (sim.get("transcript") or [])
+                                     if t.get("role") == "user" and (t.get("content") or "").strip())
+                    seen, good = set(), 0
+                    for t in calls:
+                        key = (t.get("name"), str(t.get("args")))
+                        if str(t.get("result", "")).startswith("Unknown function"):
+                            pass                     # hallucinated tool
+                        elif key in seen:
+                            pass                     # duplicate spam
+                        elif t.get("name") == "voicemail_detected" and user_turns >= 2:
+                            pass                     # a talking human is not a voicemail
+                        else:
+                            good += 1
+                        seen.add(key)
+                    res["metrics"]["tool_calling"] = round(100.0 * good / summ["attempts"], 1)
+                    res["tool_summary"] = summ
             results.append(res)
             await self.bus.emit("progress", {"run_id": self.run_id, "phase": "deepeval",
                                              "done": k + 1, "total": len(usable),
@@ -329,19 +547,28 @@ class ForgeRunner:
                     vals = [(r.get(key) or {}).get(k2) for r in results]
                 vals = [v for v in vals if isinstance(v, (int, float))]
                 out[k2] = round(_st.median(vals), 1) if vals else None
+            # tool_calling is CODE-COMPUTED, so a 0 is a real failed call, not judge
+            # noise — median would discard exactly the signal that matters. Pool it:
+            # total valid calls / total attempts across the run, weighting each
+            # conversation by how much tool work it actually did.
+            if key == "metrics":
+                out["tool_calling"] = _pooled_tool_calling(usable)
             return out
 
         # latency straight from the stored per-turn meta
-        lat_all, tok_all, lat_detail = [], [], []
+        lat_all, tok_all, lat_detail, ttft_all = [], [], [], []
         long_turns, n_text = 0, 0
         for sim in usable:
             turns = []
             tr = _rows(sim)
             for t in tr:
                 if t["role"] in ("agent", "agent_end") and t.get("latency_ms") is not None:
-                    turns.append({"ms": t["latency_ms"], "tokens": t.get("tokens"),
+                    turns.append({"ms": t["latency_ms"], "ttft_ms": t.get("ttft_ms"),
+                                  "tokens": t.get("tokens"),
                                   "text": (t.get("content") or "")[:110]})
                     lat_all.append(t["latency_ms"])
+                    if t.get("ttft_ms") is not None:
+                        ttft_all.append(t["ttft_ms"])
                     if t.get("tokens") is not None:
                         tok_all.append(t["tokens"])
                     full = (t.get("content") or "").strip()
@@ -360,6 +587,9 @@ class ForgeRunner:
             latency = {"avg_ms": round(sum(lat_all) / len(lat_all), 1),
                        "p50_ms": round(pick(0.50), 1), "p99_ms": round(pick(0.99), 1),
                        "n_turns": len(lat_all), "detail": lat_detail,
+                       # TTFT — time to the FIRST token, what a caller actually waits for
+                       "ttft_avg_ms": round(sum(ttft_all) / len(ttft_all), 1) if ttft_all else None,
+                       "ttft_p50_ms": (lambda v: round(v[min(len(v)-1, int(0.5*(len(v)-1)))], 1))(sorted(ttft_all)) if ttft_all else None,
                        "tokens_avg": round(sum(tok_all) / len(tok_all), 1) if tok_all else None,
                        "long_turn_pct": round(100.0 * long_turns / n_text, 1) if n_text else None}
         return composite, _med("sections"), _med("metrics"), latency
@@ -399,6 +629,7 @@ class ForgeRunner:
                     "version": self._cur_version, "ended": None,
                     "sim_uid": f"{self.run_id[:8]}-deep-{k}-{ti}-{_uuid.uuid4().hex[:6]}",
                     "transcript": tr or [],
+                    "tool_calls": (r.get("all_tool_calls") or [[]])[ti] if ti < len(r.get("all_tool_calls") or []) else [],
                 })
             await self.bus.emit("progress", {"run_id": self.run_id, "phase": "deepeval",
                                              "done": k + 1, "total": len(sample),
@@ -418,21 +649,30 @@ class ForgeRunner:
             for k in keys:
                 vals = [r[key][k] for r in results if (r.get(key) or {}).get(k) is not None]
                 out[k] = round(_st.median(vals), 1) if vals else None
+            # see _pooled_tool_calling: median hides real tool failures
+            if key == "metrics":
+                pooled = _pooled_from_probe_results(results)
+                if pooled is not None or "tool_calling" in out:
+                    out["tool_calling"] = pooled
             return out
 
         # ---- per-turn LLM latency (foundation: engage-voice-agents per-turn metrics) ----
         lat_all = []
         lat_detail = []
-        tok_all = []      # exact completion tokens per agent turn
+        tok_all = []
+        ttft_all = []      # exact completion tokens per agent turn
         long_turns = 0    # verbosity: turns breaking the voice rule (>40 words / >2 sentences)
         n_text_turns = 0
         for pr, r in zip(sample, results):
             turns = []
             for t in (r.get("representative_transcript") or []):
                 if t.get("role") == "agent" and t.get("latency_ms") is not None:
-                    turns.append({"ms": t["latency_ms"], "tokens": t.get("tokens"),
+                    turns.append({"ms": t["latency_ms"], "ttft_ms": t.get("ttft_ms"),
+                                  "tokens": t.get("tokens"),
                                   "text": (t.get("content") or "")[:110]})
                     lat_all.append(t["latency_ms"])
+                    if t.get("ttft_ms") is not None:
+                        ttft_all.append(t["ttft_ms"])
                     if t.get("tokens") is not None:
                         tok_all.append(t["tokens"])
                     full = (t.get("content") or "").strip()
@@ -451,12 +691,185 @@ class ForgeRunner:
             latency = {"avg_ms": round(sum(lat_all) / len(lat_all), 1),
                        "p50_ms": round(pick(0.50), 1), "p99_ms": round(pick(0.99), 1),
                        "n_turns": len(lat_all), "detail": lat_detail,
+                       # TTFT — time to the FIRST token, what a caller actually waits for
+                       "ttft_avg_ms": round(sum(ttft_all) / len(ttft_all), 1) if ttft_all else None,
+                       "ttft_p50_ms": (lambda v: round(v[min(len(v)-1, int(0.5*(len(v)-1)))], 1))(sorted(ttft_all)) if ttft_all else None,
                        # verbosity = the model-tendency yapping signal (p39), computed in
                        # code from full transcripts — same idea as prompt_lab length_check.py
                        "tokens_avg": round(sum(tok_all) / len(tok_all), 1) if tok_all else None,
                        "long_turn_pct": round(100.0 * long_turns / n_text_turns, 1) if n_text_turns else None}
 
         return composite, results, _agg("section_scores"), _agg("metrics"), latency
+
+    async def _dataset_grade_and_finish(self, sims0, problem_defs, denominator, sp, cfg,
+                                        direction, gate_pct, config_payload, greeting,
+                                        tool_checks=None):
+        """GRADE stored dataset conversations + metrics + emit v0 + run_complete.
+        Called by run() after generation, and by regrade() with a different judge —
+        the conversations are never re-run, only the judging."""
+        statuses, base_composite, base_sections, base_metrics, base_latency, _usable = \
+            await self._grade_sims(sims0, problem_defs, denominator, sp, cfg, direction)
+        await self.bus.emit("version_recorded", {
+            "run_id": self.run_id, "version": 0, "status": "baseline", "tier": "baseline",
+            "statuses": _ser(statuses), "composite": base_composite, "stress": None,
+            "tool_checks": tool_checks or {},
+            "section_scores": base_sections, "metrics": base_metrics, "latency": base_latency,
+            "solved_pct": self._solved_pct(statuses, denominator),
+            "config_json": config_payload,
+            "merged_markdown": sp, "greeting": greeting,
+        })
+        final = "llm_complete" if self._solved_pct(statuses, denominator) >= gate_pct else "converged_below_gate"
+        await self.bus.emit("run_complete", {
+            "run_id": self.run_id, "status": final,
+            "solved_pct": self._solved_pct(statuses, denominator), "final_version": 0, "parked": [],
+        })
+        return {"status": final, "solved_pct": self._solved_pct(statuses, denominator), "version": 0}
+
+    async def _combo_finish(self, combo_results, all_sims, problem_defs, denominator,
+                            gate_pct, config_payload, matrix, alloc, tool_checks):
+        """Roll the per-combo scorecards into ONE run result.
+
+        A problem counts as solved overall only if it never occurred in ANY combo — the
+        pooled view is the AND of the combos, which is the same rule the gate uses. The
+        gate itself requires EVERY combo to independently reach gate_pct, so one weak
+        stage cannot be averaged away by five strong ones."""
+        pooled = {}
+        for pid in denominator:
+            per = []
+            for cr in combo_results:
+                st = (cr["statuses"] or {}).get(pid)
+                if st:
+                    per.append((cr["key"], st))
+            if not per:
+                continue
+            failing = [(k, st) for k, st in per if st.get("verdict") != "Y"]
+            first = per[0][1]
+            pooled[pid] = {
+                "verdict": "Y" if not failing else "N",
+                "passes": sum(int(st.get("passes") or 0) for _k, st in per),
+                "votes": sum(int(st.get("votes") or 0) for _k, st in per),
+                "evidence": (f"not observed in any of {len(per)} combos" if not failing
+                             else f"occurred in {len(failing)}/{len(per)} combos: "
+                                  + ", ".join(k for k, _st in failing[:4])),
+                "sim_uids": [u for _k, st in (failing or per) for u in (st.get("sim_uids") or [])][:6],
+                "fails": [f for _k, st in failing for f in (st.get("fails") or [])][:5],
+                "by_combo": {k: st.get("verdict") for k, st in per},
+            }
+            if not first:
+                pooled[pid]["evidence"] = "no verdict"
+
+        scored = [cr for cr in combo_results if cr["n_sims"]]
+        n_convos = sum(cr["n_sims"] for cr in scored) or 1
+        def _wmean(field):
+            vals = [(cr[field], cr["n_sims"]) for cr in scored
+                    if isinstance(cr.get(field), (int, float))]
+            return round(sum(v * w for v, w in vals) / sum(w for _v, w in vals), 1) if vals else None
+
+        overall_pct = self._solved_pct(pooled, denominator)
+        failing_combos = [cr["key"] for cr in scored if not cr["passed"]]
+        # EVERY combo must pass — see docs/FORGE_COMBO_MATRIX.md
+        final = "llm_complete" if (scored and not failing_combos) else "converged_below_gate"
+
+        await self.bus.emit("version_recorded", {
+            "run_id": self.run_id, "version": 0, "status": "baseline", "tier": "baseline",
+            "statuses": _ser(pooled), "composite": _wmean("composite"), "stress": None,
+            "tool_checks": tool_checks or {},
+            "section_scores": None, "metrics": None,
+            "latency": None,
+            "solved_pct": overall_pct,
+            "config_json": config_payload,
+            "merged_markdown": None, "greeting": None,
+            "combos": combo_results,
+            "combo_matrix": {"stages": matrix.get("stages"), "allocation": alloc},
+        })
+        await self.bus.emit("run_complete", {
+            "run_id": self.run_id, "status": final, "solved_pct": overall_pct,
+            "final_version": 0, "parked": [],
+            "failing_combos": failing_combos,
+            "n_combos": len(scored), "n_conversations": n_convos,
+        })
+        return {"status": final, "solved_pct": overall_pct, "version": 0,
+                "combos": [{"key": cr["key"], "solved_pct": cr["solved_pct"],
+                            "passed": cr["passed"]} for cr in scored],
+                "failing_combos": failing_combos}
+
+    async def _grade_sims(self, sims0, problem_defs, denominator, sp, cfg, direction,
+                          combo_key=None):
+        """Sweep every problem for OCCURRENCE across a finished set of conversations, then
+        compute the metrics from those same conversations. Returns
+        (statuses, composite, sections, metrics, latency, usable). Emits no version — the
+        caller decides whether this is a whole run or one combo of a cross-product."""
+        # ---- 2. problem sweep over the finished conversations ----
+        usable = [sim for sim in sims0
+                  if any(t.get("role") == "agent" and (t.get("content") or "").strip()
+                         for t in sim["transcript"])]
+        convos = [(sim, fdet.transcript_to_convo(sim["transcript"])) for sim in usable]
+        sweep_pids = [pid for pid in denominator
+                      if pid not in METRIC_PROBLEMS and pid not in fdet.PROMPT_JUDGE_DETECTORS]
+        statuses = {}
+        total_checks = len(sweep_pids) * len(convos)
+        done_checks = 0
+        for pid in sweep_pids:
+            if self._stopped:
+                break
+            behaviour = (problem_defs.get(pid) or {}).get("behaviour") or pid
+            fails = []
+            for sim, convo in convos:
+                if pid in fdet.MECHANICAL_CHECKERS:
+                    ok, reason, fturn = fdet.MECHANICAL_CHECKERS[pid](convo, None)
+                    occurred = not ok
+                else:
+                    occurred, reason, fturn = await fdet.observe_problem(self.judge_llm, behaviour, convo)
+                if occurred:
+                    fails.append({"sim_uid": sim["sim_uid"], "reason": reason, "failing_turn": fturn})
+                done_checks += 1
+                await self.bus.emit("progress", {"run_id": self.run_id, "phase": "judging",
+                                                 "done": done_checks, "total": total_checks,
+                                                 "problem_id": pid, "combo": combo_key})
+            n = len(convos)
+            clean = n - len(fails)
+            statuses[pid] = {
+                "verdict": "Y" if not fails else "N",
+                "passes": clean, "votes": n,
+                "evidence": (f"{clean}/{n} not observed in any conversation" if not fails
+                             else f"{clean}/{n} — occurred in {len(fails)}: {fails[0]['reason']}"),
+                "sim_uids": [f["sim_uid"] for f in fails] or [sim["sim_uid"] for sim, _c in convos[:3]],
+                "fails": fails[:5],
+            }
+        # prompt-text problems still checked (free, no conversations)
+        for pid in denominator:
+            if pid in fdet.PROMPT_JUDGE_DETECTORS and pid not in statuses:
+                ok, ev, _ft = await fdet._prompt_judge(self.judge_llm, sp, fdet.PROMPT_JUDGE_DETECTORS[pid])
+                statuses[pid] = {"verdict": "Y" if ok else "N", "passes": 1 if ok else 0, "votes": 1,
+                                 "evidence": ev, "sim_uids": [], "fails": [] if ok else
+                                 [{"sim_uid": None, "reason": ev, "failing_turn": None}]}
+
+        # ---- 3. metrics from the SAME conversations ----
+        base_composite, base_sections, base_metrics, base_latency = \
+            await self._deepeval_from_sims(usable, cfg, direction)
+        self._fold_metrics(statuses, base_metrics, denominator)
+        return (statuses, base_composite, base_sections, base_metrics, base_latency, usable)
+
+    async def regrade(self, spec):
+        """RE-JUDGE stored conversations with THIS runner's judge — zero model calls
+        to the contestant. spec: {sims, problems, denominator, system_prompt,
+        config_for_scorer, direction, gate_pct, config_payload, greeting}."""
+        problem_defs = {p["id"]: p for p in spec.get("problems", [])}
+        denominator = list(spec.get("denominator") or [])
+        sims0 = [{"sim_uid": x.get("sim_uid"), "pid": None, "probe": x.get("probe"),
+                  "idx": x.get("idx"), "transcript": x.get("transcript") or [],
+                  "tool_calls": x.get("tool_calls") or [],
+                  "fired": [t.get("name") for t in (x.get("tool_calls") or []) if t.get("name")],
+                  "ended": bool(x.get("ended"))} for x in (spec.get("sims") or [])]
+        await self.bus.emit("run_start", {"run_id": self.run_id, "mode": "standalone",
+                                          "denominator": denominator, "n_problems": len(denominator),
+                                          "regrade": True})
+        return await self._dataset_grade_and_finish(
+            sims0, problem_defs, denominator,
+            spec.get("system_prompt") or "", spec.get("config_for_scorer") or {},
+            spec.get("direction") or "outbound", float(spec.get("gate_pct", 95)),
+            spec.get("config_payload") or {}, spec.get("greeting") or "",
+            tool_checks=spec.get("tool_checks") or {})
 
     # ---- main loop ----------------------------------------------------------
     async def run(self, spec):
@@ -508,120 +921,172 @@ class ForgeRunner:
         bundle = {"system_prompt": sp, "config": cfg, "greeting": greeting}
         single_pass = bool(scoring.get("single_pass"))
         if single_pass:
-            # DATASET MODE (the user's spec, verbatim): X dataset personas -> X free
-            # conversations for THIS model. Nothing is judged until all X finish. Then
-            # every problem is checked FOR OCCURRENCE inside those conversations:
-            # never appeared -> solved; appeared -> failed, that conversation is the proof.
-            # Metrics are computed from the SAME conversations. No staged scenarios,
-            # no retries, no confirmations, no stress. 4 LLMs x X = the whole fight.
+            # DATASET MODE across the FULL CROSS-PRODUCT of call direction x lead_status.
+            # Every persona is replayed in every combo; nothing is judged until all the
+            # conversations of a combo finish; then every problem is checked FOR
+            # OCCURRENCE inside them. Per-combo scorecards + a pooled overall, and the
+            # gate requires EVERY combo to pass. See docs/FORGE_COMBO_MATRIX.md.
             import uuid as _uuid
-            X = len(probes)
-            await self.bus.emit("iteration_note", {"run_id": self.run_id, "attempt": 0,
-                                "note": f"dataset pass — {X} conversations, then problem sweep"})
-            # ---- 1. ALL conversations first ----
-            sims0 = []
-            n_errors = 0
-            for i2, probe in enumerate(probes):
-                if self._stopped:
-                    break
-                scenario = {
-                    "name": str(probe.get("id") or f"sim-{i2}"),
-                    "greeting": greeting or "",
-                    "call_direction": direction,
-                    "user_persona": probe.get("persona") or probe.get("user_persona") or "",
-                    "max_turns": int(probe.get("max_turns", 10)),
-                }
-                try:
-                    res = await self.engine.run_simulated(sp, scenario)
-                except Exception as e:
-                    res = {"transcript": [{"role": "user", "content": f"[generation error: {str(e)[:100]}]"}],
-                           "tool_calls": []}
-                tr = res.get("transcript") or []
-                if any("[generation error" in (t.get("content") or "") for t in tr)                         or not any(t.get("role") == "agent" and (t.get("content") or "").strip() for t in tr):
-                    n_errors += 1
-                fired = [tc.get("name") for tc in (res.get("tool_calls") or []) if tc.get("name")]
-                sim = {"sim_uid": f"{self.run_id[:8]}-data-{i2}-{_uuid.uuid4().hex[:6]}",
-                       "pid": None, "probe": scenario["name"], "idx": i2,
-                       "transcript": tr, "fired": fired,
-                       "ended": "end_call" in fired}
-                sims0.append(sim)
-                await self.bus.emit("sim_recorded", {
-                    "run_id": self.run_id, "sim_uid": sim["sim_uid"], "kind": "dataset",
-                    "probe": sim["probe"], "idx": i2, "version": 0,
-                    "ended": sim["ended"], "transcript": tr,
-                    "tool_calls": res.get("tool_calls") or [],
+
+            matrix = fcombo.build_matrix(mode, champion,
+                                         default_direction=direction,
+                                         default_lead_status=lead_status)
+            resolved = fcombo.apply_resolutions(matrix, spec.get("combo_resolutions"))
+            if resolved["blocked"]:
+                # HUMAN GATE: the whole run halts. The prompt cannot serve these combos and
+                # guessing would test a prompt production never sends. The human writes the
+                # missing content (or rules on a fallback/skip), and it is ALSO handed to the
+                # coach as a problem to fix, so the optimized prompt ends up containing it.
+                await self.bus.emit("human_gate", {
+                    "run_id": self.run_id, "reason": "invalid_combos",
+                    "blocked": resolved["blocked"],
+                    "stages": matrix["stages"],
+                    "message": (f"{len(resolved['blocked'])} combo(s) cannot be served by this "
+                                f"prompt. The run is halted until you rule on them."),
                 })
-                await self.bus.emit("progress", {"run_id": self.run_id, "phase": "conversations",
-                                                 "done": i2 + 1, "total": X, "probe": sim["probe"]})
-            if X >= 3 and n_errors / max(1, len(sims0)) > 0.5:
-                first_err = next((t.get("content") for sim in sims0 for t in sim["transcript"]
-                                  if "[generation error" in (t.get("content") or "")), "")
-                raise RuntimeError(f"endpoint failing: {n_errors}/{len(sims0)} conversations errored — {str(first_err)[:180]}")
+                await self.bus.emit("run_complete", {
+                    "run_id": self.run_id, "status": "needs_human_combo",
+                    "solved_pct": None, "final_version": 0, "parked": [],
+                })
+                return {"status": "needs_human_combo", "blocked": resolved["blocked"]}
 
-            # ---- 2. problem sweep over the finished conversations ----
-            usable = [sim for sim in sims0
-                      if any(t.get("role") == "agent" and (t.get("content") or "").strip()
-                             for t in sim["transcript"])]
-            convos = [(sim, fdet.transcript_to_convo(sim["transcript"])) for sim in usable]
-            sweep_pids = [pid for pid in denominator
-                          if pid not in METRIC_PROBLEMS and pid not in fdet.PROMPT_JUDGE_DETECTORS]
-            statuses = {}
-            total_checks = len(sweep_pids) * len(convos)
-            done_checks = 0
-            for pid in sweep_pids:
+            combos = resolved["combos"]
+            alloc = fcombo.plan(len(probes), len(combos))
+            if alloc["capped"]:
+                # never truncate silently — say exactly what was dropped
+                await self.bus.emit("iteration_note", {
+                    "run_id": self.run_id, "attempt": 0,
+                    "note": (f"cap {alloc['cap']}: {len(combos)} combos x {len(probes)} personas "
+                             f"= {len(combos) * len(probes)} conversations. Reduced to "
+                             f"{alloc['per_combo']} personas per combo ({alloc['total']} total); "
+                             f"{alloc['dropped']} personas dropped."),
+                })
+            await self.bus.emit("combo_matrix", {
+                "run_id": self.run_id, "stages": matrix["stages"],
+                "combos": combos, "allocation": alloc,
+            })
+
+            use_probes = probes[:alloc["per_combo"]]
+            grand_total = alloc["total"]
+            done_all = 0
+            combo_results = []
+            all_sims = []
+            n_errors = 0
+
+            # tool-capability checks run ONCE per run (prompt-level, not stage-level)
+            tool_checks = {}
+
+            for ci, combo in enumerate(combos):
                 if self._stopped:
                     break
-                behaviour = (problem_defs.get(pid) or {}).get("behaviour") or pid
-                fails = []
-                for sim, convo in convos:
-                    if pid in fdet.MECHANICAL_CHECKERS:
-                        ok, reason, fturn = fdet.MECHANICAL_CHECKERS[pid](convo, None)
-                        occurred = not ok
-                    else:
-                        occurred, reason, fturn = await fdet.observe_problem(self.judge_llm, behaviour, convo)
-                    if occurred:
-                        fails.append({"sim_uid": sim["sim_uid"], "reason": reason, "failing_turn": fturn})
-                    done_checks += 1
-                    await self.bus.emit("progress", {"run_id": self.run_id, "phase": "judging",
-                                                     "done": done_checks, "total": total_checks,
-                                                     "problem_id": pid})
-                n = len(convos)
-                clean = n - len(fails)
-                statuses[pid] = {
-                    "verdict": "Y" if not fails else "N",
-                    "passes": clean, "votes": n,
-                    "evidence": (f"{clean}/{n} not observed in any conversation" if not fails
-                                 else f"{clean}/{n} — occurred in {len(fails)}: {fails[0]['reason']}"),
-                    "sim_uids": [f["sim_uid"] for f in fails] or [sim["sim_uid"] for sim, _c in convos[:3]],
-                    "fails": fails[:5],
-                }
-            # prompt-text problems still checked (free, no conversations)
-            for pid in denominator:
-                if pid in fdet.PROMPT_JUDGE_DETECTORS and pid not in statuses:
-                    ok, ev, _ft = await fdet._prompt_judge(self.judge_llm, sp, fdet.PROMPT_JUDGE_DETECTORS[pid])
-                    statuses[pid] = {"verdict": "Y" if ok else "N", "passes": 1 if ok else 0, "votes": 1,
-                                     "evidence": ev, "sim_uids": [], "fails": [] if ok else
-                                     [{"sim_uid": None, "reason": ev, "failing_turn": None}]}
+                cdir, cstatus = combo["direction"], combo["lead_status"]
+                csp, ccfg, cgreeting = self._build_prompt(
+                    mode, champion, cdir, cstatus,
+                    greeting_override=combo.get("greeting_override"))
+                if not tool_checks and scoring.get("tool_checks", True):
+                    tool_checks = await self._run_tool_checks(csp, cgreeting)
+                    # fix_tools defaults OFF here: single-pass is observation — an arena
+                    # that silently rewrites a contestant's prompt isn't comparing LLMs.
+                    if tchecks.failing(tool_checks) and scoring.get("fix_tools", False):
+                        champion, tool_checks, _tf, csp, cgreeting = \
+                            await self._fix_tool_calls(mode, champion, tool_checks,
+                                                       csp, cgreeting, cdir, cstatus)
 
-            # ---- 3. metrics from the SAME conversations ----
-            base_composite, base_sections, base_metrics, base_latency = \
-                await self._deepeval_from_sims(usable, cfg, direction)
-            self._fold_metrics(statuses, base_metrics, denominator)
-            await self.bus.emit("version_recorded", {
-                "run_id": self.run_id, "version": 0, "status": "baseline", "tier": "baseline",
-                "statuses": _ser(statuses), "composite": base_composite, "stress": None,
-                "section_scores": base_sections, "metrics": base_metrics, "latency": base_latency,
-                "solved_pct": self._solved_pct(statuses, denominator),
-                "config_json": (champion.get("layers") if mode == "layered" else {"blob": champion.get("blob")}),
-                "merged_markdown": sp, "greeting": greeting,
-            })
-            final = "llm_complete" if self._solved_pct(statuses, denominator) >= gate_pct else "converged_below_gate"
-            await self.bus.emit("run_complete", {
-                "run_id": self.run_id, "status": final,
-                "solved_pct": self._solved_pct(statuses, denominator), "final_version": 0, "parked": [],
-            })
-            return {"status": final, "solved_pct": self._solved_pct(statuses, denominator), "version": 0}
+                await self.bus.emit("iteration_note", {
+                    "run_id": self.run_id, "attempt": 0,
+                    "note": (f"combo {ci + 1}/{len(combos)} — {combo['key']}: "
+                             f"{len(use_probes)} conversations"),
+                })
 
+                sims_c = []
+                for i2, probe in enumerate(use_probes):
+                    if self._stopped:
+                        break
+                    # the lead block AND the greeting are synthesized per combo, so a
+                    # followup call carries a follow-up reason and the agent always knows
+                    # the customer's name (production substitutes <name> before speaking).
+                    lead = fcombo.lead_profile(probe, cdir, cstatus)
+                    sp_c, _cfg2, _g2 = self._build_prompt(
+                        mode, champion, cdir, cstatus, lead=lead,
+                        greeting_override=combo.get("greeting_override"))
+                    scenario = {
+                        "name": str(probe.get("id") or f"sim-{i2}"),
+                        "greeting": fcombo.substitute_name(cgreeting or "", lead["name"]),
+                        "call_direction": cdir,
+                        "user_persona": probe.get("persona") or probe.get("user_persona") or "",
+                        "max_turns": int(probe.get("max_turns", 10)),
+                    }
+                    try:
+                        res = await self.engine.run_simulated(sp_c, scenario)
+                    except Exception as e:
+                        res = {"transcript": [{"role": "user", "content": f"[generation error: {str(e)[:100]}]"}],
+                               "tool_calls": []}
+                    tr = res.get("transcript") or []
+                    if any("[generation error" in (t.get("content") or "") for t in tr) \
+                            or not any(t.get("role") == "agent" and (t.get("content") or "").strip() for t in tr):
+                        n_errors += 1
+                    fired = [tc.get("name") for tc in (res.get("tool_calls") or []) if tc.get("name")]
+                    sim = {"sim_uid": f"{self.run_id[:8]}-d{ci}-{i2}-{_uuid.uuid4().hex[:6]}",
+                           "pid": None, "probe": scenario["name"], "idx": i2,
+                           "combo": combo["key"], "direction": cdir, "lead_status": cstatus,
+                           "transcript": tr, "fired": fired,
+                           "tool_calls": res.get("tool_calls") or [],
+                           "tool_leaks": res.get("tool_leaks") or [],
+                           "expected_tools": probe.get("expected_tools") or [],
+                           "ended": "end_call" in fired}
+                    sims_c.append(sim)
+                    all_sims.append(sim)
+                    done_all += 1
+                    await self.bus.emit("sim_recorded", {
+                        "run_id": self.run_id, "sim_uid": sim["sim_uid"], "kind": "dataset",
+                        "probe": sim["probe"], "idx": i2, "version": 0,
+                        "combo": combo["key"], "direction": cdir, "lead_status": cstatus,
+                        "ended": sim["ended"], "transcript": tr,
+                        "tool_calls": sim["tool_calls"],
+                        "tool_leaks": sim["tool_leaks"],
+                        "tool_summary": self._tool_summary(sim["tool_calls"], sim["tool_leaks"],
+                                                           sim.get("expected_tools")),
+                    })
+                    await self.bus.emit("progress", {"run_id": self.run_id, "phase": "conversations",
+                                                     "done": done_all, "total": grand_total,
+                                                     "combo": combo["key"], "probe": sim["probe"]})
+
+                if grand_total >= 3 and n_errors / max(1, len(all_sims)) > 0.5:
+                    first_err = next((t.get("content") for sim in all_sims for t in sim["transcript"]
+                                      if "[generation error" in (t.get("content") or "")), "")
+                    raise RuntimeError(f"endpoint failing: {n_errors}/{len(all_sims)} conversations errored — {str(first_err)[:180]}")
+
+                statuses_c, comp_c, sect_c, met_c, lat_c, _usable = await self._grade_sims(
+                    sims_c, problem_defs, denominator, csp, ccfg, cdir, combo_key=combo["key"])
+                pct_c = self._solved_pct(statuses_c, denominator)
+                combo_results.append({
+                    "key": combo["key"], "direction": cdir, "lead_status": cstatus,
+                    "resolution": combo.get("resolution"),
+                    "n_sims": len(sims_c), "statuses": _ser(statuses_c),
+                    "composite": comp_c, "section_scores": sect_c, "metrics": met_c,
+                    "latency": lat_c, "solved_pct": pct_c, "passed": pct_c >= gate_pct,
+                })
+                await self.bus.emit("combo_scored", {
+                    "run_id": self.run_id, "combo": combo["key"], "solved_pct": pct_c,
+                    "composite": comp_c, "passed": pct_c >= gate_pct, "n_sims": len(sims_c),
+                })
+
+            return await self._combo_finish(
+                combo_results, all_sims, problem_defs, denominator, gate_pct,
+                (champion.get("layers") if mode == "layered" else {"blob": champion.get("blob")}),
+                matrix, alloc, tool_checks)
+
+        base_tool_checks = {}
+        tool_fixes = []
+        if scoring.get("tool_checks", True):
+            base_tool_checks = await self._run_tool_checks(sp, greeting)
+            # the endings lesson, generalised: a failing tool check is the cleanest fix
+            # target there is — scripted situation, unambiguous action, proven lever.
+            # Coach it now so the matrix and sims run against a prompt whose tools fire.
+            if tchecks.failing(base_tool_checks) and scoring.get("fix_tools", True):
+                champion, base_tool_checks, tool_fixes, sp, greeting = \
+                    await self._fix_tool_calls(mode, champion, base_tool_checks,
+                                               sp, greeting, direction, lead_status)
         statuses = await self._run_matrix(sp, greeting, denominator, votes)
         # SOLVED needs proof at scale: deep-confirm every screen-Y before it counts.
         screen_ys = [pid for pid in denominator
@@ -640,6 +1105,7 @@ class ForgeRunner:
                 "version": self._cur_version, "ended": bool(res.get("tool_calls")),
                 "sim_uid": f"{self.run_id[:8]}-strs-{idx}-{_uuid.uuid4().hex[:6]}",
                 "transcript": res.get("transcript") or [],
+                "tool_calls": res.get("tool_calls") or [],
             })
         stress0 = await fstress.run_stress(self.engine, sp, greeting, probes, direction=direction,
                                            target=stress_target, on_progress=_stress_beat,
@@ -650,6 +1116,7 @@ class ForgeRunner:
         await self.bus.emit("version_recorded", {
             "run_id": self.run_id, "version": 0, "status": "baseline", "tier": "baseline",
             "statuses": _ser(statuses), "composite": base_composite, "stress": stress0.get("metrics"),
+            "tool_checks": base_tool_checks, "tool_fixes": tool_fixes,
             "section_scores": base_sections, "metrics": base_metrics, "latency": base_latency,
             "solved_pct": self._solved_pct(statuses, denominator),
             # v0 carries the starting prompt so export/diff/review always have a base.
@@ -718,6 +1185,9 @@ class ForgeRunner:
                     current_prompt=coach_blob,
                     layers=(champion.get("layers") if mode == "layered" else None),
                     revert_history=revert_history,
+                    # re-read EVERY iteration: the operator types into the guidance panel
+                    # while the run is going, and the next proposal must already obey it
+                    guidance=await self._coach_guidance(spec),
                 )
 
                 # escalation -> park the whole cluster & continue
@@ -901,5 +1371,5 @@ class ForgeRunner:
 
 def _ser(statuses):
     # keep the proof fields (votes + sim links) — the report card and ProofPanel need them
-    keep = ("verdict", "evidence", "passes", "votes", "sim_uids", "fails")
+    keep = ("verdict", "evidence", "passes", "votes", "sim_uids", "fails", "source")
     return {pid: {k: v.get(k) for k in keep if v.get(k) is not None} for pid, v in statuses.items()}

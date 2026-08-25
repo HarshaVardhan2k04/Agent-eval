@@ -19,9 +19,13 @@ DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_QUALITY_THRESHOLD = 0.9
 DEFAULT_CONCURRENT_SCENARIOS = 4
 DEFAULT_MAX_LLM_CONCURRENCY = 8
-DEFAULT_AGENT_TEMPERATURE = 0.3
-DEFAULT_JUDGE_TEMPERATURE = 0.1
+DEFAULT_AGENT_TEMPERATURE = 0.0   # deterministic agent turns — a verdict shouldn't move on sampling luck
+DEFAULT_JUDGE_TEMPERATURE = 0.4   # judge thinks; a little sampling room reads evidence better
 DEFAULT_RESOLVER_TEMPERATURE = 0.3
+# The coach REASONS about a prompt (diagnose -> route to a layer -> author a surgical
+# edit); it is not the agent under test. Give it sampling room and thinking, the same
+# way the judge gets them. 0.0 made it repeat the same dead-end edit after a revert.
+DEFAULT_COACH_TEMPERATURE = 0.4
 DEFAULT_USER_TEMPERATURE = 0.7
 DEFAULT_MAX_TOKENS = 300
 DEFAULT_JUDGE_MAX_TOKENS = 3000          # judge runs with thinking on, needs room to reason

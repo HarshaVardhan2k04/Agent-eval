@@ -97,7 +97,7 @@ class HallucinationMetric:
                 }]
             try:
                 return await self.client.chat_json(
-                    msgs, temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=max_tokens, enable_thinking=False
+                    msgs, temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=max_tokens, enable_thinking=True
                 )
             except Exception as e:
                 last_err = e

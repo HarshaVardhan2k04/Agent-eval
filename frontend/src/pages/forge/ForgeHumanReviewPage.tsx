@@ -5,7 +5,7 @@ import { T, card, label, btnPrimary, backBtn } from '../../theme'
 import { api } from '../../api/client'
 import { useForgeStore } from '../../stores/forgeStore'
 import { ScoreRing } from '../../components/analysis'
-import { RunStatusChip, SolvedGauge, LayerBadge, VerdictCell } from '../../components/forge'
+import { RunStatusChip, SolvedGauge, LayerBadge, VerdictCell , SizeHint } from '../../components/forge'
 
 type ChatMsg = { role: 'user' | 'agent'; content: string }
 
@@ -46,6 +46,11 @@ export function ForgeHumanReviewPage() {
     return latest.merged_markdown || ''
   }, [latest, run])
   const originalText = useMemo(() => {
+    // Compare LIKE with LIKE: the original side is v0's MERGED MARKDOWN — the same
+    // representation as the current side. Diffing raw layer JSON against rendered
+    // markdown marks every line as changed and means nothing.
+    const v0 = run ? run.versions.find((v) => v.version === 0 && v.merged_markdown) : null
+    if (v0?.merged_markdown) return v0.merged_markdown
     const snap = run?.original_prompt_snapshot
     if (!snap) return ''
     if (snap.blob) return typeof snap.blob === 'string' ? snap.blob : JSON.stringify(snap.blob, null, 2)
@@ -81,6 +86,7 @@ export function ForgeHumanReviewPage() {
   const solvedPids = Object.entries(statuses).filter(([, s]) => s.verdict === 'Y').map(([p]) => p)
   const openPids = Object.entries(statuses).filter(([, s]) => s.verdict !== 'Y').map(([p]) => p)
   const acceptedVersions = run.versions.filter((v) => v.status === 'accepted')
+  const revertedVersions = run.versions.filter((v) => v.status === 'reverted')
   const denom = run.denominator_snapshot_json?.length ?? null
   const gate = Number(run.scoring_json?.gate_pct ?? 95)
   const finalized = run.status === 'finalized'
@@ -168,8 +174,14 @@ export function ForgeHumanReviewPage() {
           <div style={{ ...card, overflow: 'hidden' }}>
             <div style={{ padding: '11px 16px', borderBottom: `1px solid ${T.divider}`, ...label }}>Original (as given) vs current (LLM-complete)</div>
             <div style={{ maxHeight: 420, overflow: 'auto', fontSize: 12 }}>
-              <ReactDiffViewer oldValue={originalText} newValue={currentPromptText} splitView useDarkTheme
-                leftTitle="Original" rightTitle="Current" />
+              {originalText === currentPromptText ? (
+                <div style={{ padding: '26px 20px', fontSize: 13, color: T.faint }}>
+                  No surviving changes — every coach edit was reverted, so the current prompt IS the original.
+                </div>
+              ) : (
+                <ReactDiffViewer oldValue={originalText} newValue={currentPromptText} splitView useDarkTheme
+                  leftTitle="Original" rightTitle="Current" />
+              )}
             </div>
           </div>
 
@@ -224,6 +236,25 @@ export function ForgeHumanReviewPage() {
                 </div>
               ))}
               {acceptedVersions.length === 0 && <div style={{ fontSize: 12.5, color: T.faint }}>No accepted changes — the baseline is the champion.</div>}
+              {revertedVersions.length > 0 && (
+                <>
+                  <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em', color: T.amber, marginTop: 4 }}>
+                    Tried & reverted — the re-test said these didn't actually fix it
+                  </div>
+                  {revertedVersions.map((v) => (
+                    <div key={v.version} style={{ background: T.well, borderRadius: 10, padding: '11px 13px', borderLeft: `3px solid ${T.amber}`, opacity: 0.85 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 9, flexWrap: 'wrap' }}>
+                        <span style={{ fontFamily: T.mono, fontSize: 12, fontWeight: 700, color: T.text2 }}>v{v.version}</span>
+                        <span style={{ fontFamily: T.mono, fontSize: 12, color: T.amber }}>{v.targeted_problem}</span>
+                        <LayerBadge layer={v.layer_for_fix} />
+                        <span style={{ fontSize: 10.5, color: T.amber, textTransform: 'uppercase', letterSpacing: '0.04em' }}>reverted</span>
+                      </div>
+                      {v.diagnosis && <div style={{ fontSize: 12, color: T.muted, marginTop: 6, lineHeight: 1.5 }}>diagnosis: {v.diagnosis}</div>}
+                      <div style={{ fontSize: 12.5, color: T.text3, marginTop: 5, lineHeight: 1.55 }}>{v.changes_summary}</div>
+                    </div>
+                  ))}
+                </>
+              )}
             </div>
           </div>
 
@@ -238,6 +269,7 @@ export function ForgeHumanReviewPage() {
             <textarea value={editedPrompt} onChange={(e) => setEditedPrompt(e.target.value)} rows={10} disabled={finalized}
               onBlur={() => save({ edited_prompt: editedPrompt })}
               style={{ width: '100%', boxSizing: 'border-box', padding: '12px 14px', borderRadius: 11, background: T.well, border: `1px solid ${T.border2}`, color: T.text2, fontSize: 12, fontFamily: T.mono, lineHeight: 1.55, outline: 'none', resize: 'vertical' }} />
+            <SizeHint text={editedPrompt} label="your edit" warnTokens={8000} />
           </div>
 
           {/* live chat */}

@@ -10,7 +10,7 @@ Standalone mode has no layers: the coach edits the single blob with append/prepe
 """
 from __future__ import annotations
 
-from src.config import DEFAULT_RESOLVER_TEMPERATURE, DEFAULT_COACH_PATCH_MAX_TOKENS
+from src.config import DEFAULT_COACH_TEMPERATURE, DEFAULT_COACH_PATCH_MAX_TOKENS
 from src.forge.merge import deep_merge
 
 LAYER_PURPOSE = """LAYER PURPOSES (route each fix to the layer where it is TRUE — this governs its blast radius):
@@ -24,7 +24,49 @@ LAYER_PURPOSE = """LAYER PURPOSES (route each fix to the layer where it is TRUE 
               client-specific (company name, offer, this campaign's conversational_flow).
               Blast radius = this campaign only — safe to edit freely."""
 
-COACH_SYS = "You are an expert voice-agent prompt engineer. Reply with strict JSON only."
+COACH_SYS = """You are the COACH inside Forge, an automated prompt-optimisation system for
+production voice AI agents. Before you propose anything, understand your situation.
+
+WHO YOU ARE
+  A senior voice-agent prompt engineer. You do not talk to customers. You rewrite the
+  system prompt that a different LLM — the "agent under test" — will use to talk to them.
+
+WHAT THE SYSTEM AROUND YOU DOES
+  1. Forge takes a prompt and runs it through many simulated phone calls: a dataset of
+     lead personas, played by a second LLM, across every call direction (outbound,
+     inbound, follow-up) and every lead_status stage the prompt defines.
+  2. A judge LLM then sweeps those finished conversations for a catalogue of known
+     failure behaviours ("problems"). A problem is SOLVED only if it never occurred in
+     any conversation; one occurrence marks it failed and the conversation is the proof.
+  3. You are handed the single worst OPEN problem and asked for ONE fix.
+  4. Your edit is applied, the whole battery is re-run, and an adversarial verifier
+     tries to REFUTE that your fix worked. If the problem recurs, or another problem
+     regresses, your edit is REVERTED and you are told why.
+
+WHY YOU EXIST
+  The prompt has to survive real calls, not look good on paper. Every point of score is
+  a real customer conversation that did not go wrong. A fix that games the detector but
+  does not change behaviour is worse than no fix: it burns an iteration and hides the bug.
+
+WHEN AND WHERE YOUR OUTPUT LANDS
+  Your edits go into a layered prompt that MANY live agents share, or into a single
+  standalone prompt. Layer choice decides blast radius, so it is a real engineering
+  decision, not a formality. A human reviews everything at the end — but you are expected
+  to get the prompt as close to finished as an LLM can.
+
+HOW TO WORK
+  - ONE concern per proposal. Surgical, minimal, specific. Do not rewrite wholesale.
+  - Diagnose before you edit: say WHY the agent behaved that way, not just what to add.
+    An instruction that repeats what the prompt already says will not change anything —
+    if the rule is already there and being ignored, the fix is to make it unmissable
+    (position, phrasing, concreteness), not to say it a second time.
+  - Prefer a rule the agent can FOLLOW at speaking time over an abstract principle.
+  - Never contradict an existing instruction without removing the one you contradict.
+  - Reuse the proven lever when one is recorded — it already worked on this problem.
+  - Read the reverted attempts. Repeating a dead end wastes a full battery run.
+  - Honour the operator's guidance verbatim when it is given. It outranks your taste.
+
+Reply with strict JSON only. No prose outside the JSON."""
 
 _STANDALONE_TMPL = """{layer_purpose}
 
@@ -40,7 +82,7 @@ CURRENT PROMPT (blob):
 {current_prompt}
 
 {revert_feedback}
-
+{guidance}
 Make the SMALLEST change that fixes ONLY this problem without breaking anything else.
 Return JSON:
 {{
@@ -72,7 +114,7 @@ CURRENT LAYERS (JSON):
   vertical (read-only reference): {vertical_ref}
 
 {revert_feedback}
-
+{guidance}
 Return JSON:
 {{
   "layer_for_fix": "universal|vertical|campaign",
@@ -96,6 +138,19 @@ set writes a value at a dot-path, merge deep-merges an object patch. Never emit 
 like append/replace here."""
 
 
+def _guidance_block(guidance):
+    """The operator's own standing instructions for this run, typed live in the side
+    panel. These are not suggestions — the human running the optimisation knows things
+    about this campaign the coach cannot infer from the transcripts."""
+    text = (guidance or "").strip()
+    if not text:
+        return ""
+    return ("\nOPERATOR GUIDANCE FOR THIS RUN (written by the human running it — follow it "
+            "exactly; if it conflicts with your own instinct, the operator wins; if it "
+            "conflicts with the problem you were asked to fix, say so in fix_strategy):\n"
+            + text[:2000] + "\n")
+
+
 def _revert_feedback(revert_history):
     if not revert_history:
         return ""
@@ -109,20 +164,22 @@ class Coach:
     def __init__(self, llm_client):
         self.llm = llm_client
 
-    async def propose(self, *, mode, problem, current_prompt=None, layers=None, revert_history=None):
+    async def propose(self, *, mode, problem, current_prompt=None, layers=None,
+                      revert_history=None, guidance=None):
         """Propose one fix. `problem` = {id, behaviour, evidence, layer_for_fix, lever}.
         Returns a decision dict (see per-mode template)."""
         if mode == "layered":
-            return await self._propose_layered(problem, layers or {}, revert_history)
-        return await self._propose_standalone(problem, current_prompt or "", revert_history)
+            return await self._propose_layered(problem, layers or {}, revert_history, guidance)
+        return await self._propose_standalone(problem, current_prompt or "", revert_history, guidance)
 
-    async def _propose_standalone(self, problem, current_prompt, revert_history):
+    async def _propose_standalone(self, problem, current_prompt, revert_history, guidance=None):
         prompt = _STANDALONE_TMPL.format(
             layer_purpose=LAYER_PURPOSE,
             problem_id=problem.get("id"), behaviour=problem.get("behaviour", ""),
             evidence=problem.get("evidence", ""), lever=problem.get("lever") or "(none recorded)",
             current_prompt=str(current_prompt)[:8000],
             revert_feedback=_revert_feedback(revert_history),
+            guidance=_guidance_block(guidance),
         )
         data = await self._call(prompt)
         if not data:
@@ -130,7 +187,7 @@ class Coach:
         data.update({"layer_for_fix": "standalone", "escalate": False, "needs_human": False})
         return data
 
-    async def _propose_layered(self, problem, layers, revert_history):
+    async def _propose_layered(self, problem, layers, revert_history, guidance=None):
         import json as _json
         campaign = layers.get("campaign", {})
         prompt = _LAYERED_TMPL.format(
@@ -143,6 +200,7 @@ class Coach:
             universal_ref=_json.dumps(layers.get("universal", {}))[:1500],
             vertical_ref=_json.dumps(layers.get("vertical", {}))[:1500],
             revert_feedback=_revert_feedback(revert_history),
+            guidance=_guidance_block(guidance),
         )
         data = await self._call(prompt)
         if not data:
@@ -229,7 +287,7 @@ class Coach:
             try:
                 data = await self.llm.chat_json(
                     [{"role": "system", "content": COACH_SYS}, {"role": "user", "content": prompt}],
-                    temperature=DEFAULT_RESOLVER_TEMPERATURE,
+                    temperature=DEFAULT_COACH_TEMPERATURE,
                     max_tokens=DEFAULT_COACH_PATCH_MAX_TOKENS,
                     enable_thinking=thinking,
                 )

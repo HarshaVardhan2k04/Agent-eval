@@ -29,6 +29,9 @@ _WEEKDAYS = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
     "friday": 4, "saturday": 5, "sunday": 6,
 }
+_MONTHS = {"january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+           "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12}
+_ORDINALS = {"first": 0, "second": 1, "third": 2, "fourth": 3, "fifth": 4}
 _TEMPLATE_TOKEN_RE = re.compile(r"<\|[^|]*\|?>")
 
 
@@ -85,7 +88,12 @@ def _compute_date(expression):
         if target is None and ("end of this month" in expr or "end of the month" in expr or expr == "end of month"):
             next_month_first = today.replace(day=1) + relativedelta(months=1)
             target = next_month_first - timedelta(days=1)
-        if target is None and "next month" in expr:
+        # an ORDINAL weekday phrase ("second saturday of next month") must not be
+        # swallowed by the plain next-month branch — that returned a wrong weekday.
+        _has_ordinal_wd = bool(re.search(
+            r"(first|second|third|fourth|fifth|last)\s+"
+            r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)", expr))
+        if target is None and "next month" in expr and not _has_ordinal_wd:
             target = today + relativedelta(months=1)
         if target is None and expr == "next week":
             target = today + timedelta(weeks=1)
@@ -98,6 +106,42 @@ def _compute_date(expression):
                 offset = this_sat_offset
             target = today + timedelta(days=offset)
         if target is None:
+            m = re.search(
+                r"(first|second|third|fourth|fifth|last)\s+"
+                r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(?:of|in)\s+"
+                r"(january|february|march|april|may|june|july|august|september|october|november|december"
+                r"|next month|this month)(?:\s+(\d{4}))?",
+                expr)
+            if m:
+                ordinal, day_name, month_tok, year_str = m.groups()
+                wd = _WEEKDAYS[day_name]
+                if month_tok == "next month":
+                    ref = today + relativedelta(months=1)
+                    month_num, year = ref.month, ref.year
+                elif month_tok == "this month":
+                    month_num, year = today.month, today.year
+                else:
+                    month_num = _MONTHS[month_tok]
+                    year = int(year_str) if year_str else today.year
+                def _nth(y, mo):
+                    first = today.replace(year=y, month=mo, day=1)
+                    if ordinal == "last":
+                        last = first + relativedelta(months=1) - timedelta(days=1)
+                        return last - timedelta(days=(last.weekday() - wd) % 7)
+                    cand = first + timedelta(days=(wd - first.weekday()) % 7 + 7 * _ORDINALS[ordinal])
+                    return cand if cand.month == mo else None
+                target = _nth(year, month_num)
+                if target is None:
+                    return (f"today is '{today_str}' so '{expression}' does not exist — "
+                            f"there is no {ordinal} {day_name} in that month. "
+                            "Please ask the user for a different day.")
+                if not year_str and month_tok not in ("next month", "this month") and target < today:
+                    target = _nth(year + 1, month_num)
+
+        # Bare-weekday fallback ONLY when the phrase isn't month-anchored — guessing
+        # "nearest saturday" for "second saturday of september" returns a confidently
+        # wrong date and sends the model into a tool-retry loop (production bug, fixed there too).
+        if target is None and " of " not in expr and not any(mn in expr for mn in _MONTHS):
             for day_name, weekday_num in _WEEKDAYS.items():
                 if day_name in expr:
                     days_until = (weekday_num - today.weekday()) % 7
@@ -116,10 +160,30 @@ def _compute_date(expression):
 
 
 class ToolSimulator:
+    # Production gates on metadata STRINGS, which don't all equal the function name
+    # (orchestrator.py: "warm_transfer" -> warm_transfer_call). Feeding a real
+    # campaign's available_tools straight in used to silently drop those tools.
+    ALIASES = {"warm_transfer": "warm_transfer_call", "transfer": "warm_transfer_call",
+               "whatsapp": "send_whatsapp_template", "rag": "search_knowledge_base",
+               "knowledge_base": "search_knowledge_base", "geolocation": "get_location_details",
+               "location": "get_location_details"}
+
     def __init__(self, enabled_tools, rag_client=None):
         # Production orchestrator semantics: the 4 core tools are ALWAYS on;
         # everything else is gated on the campaign's available_tools list.
-        gated = [t for t in (enabled_tools or []) if t not in CORE_TOOLS]
+        resolved, unknown = [], []
+        for t in (enabled_tools or []):
+            name = self.ALIASES.get(t, t)
+            if name in TOOL_DEFINITIONS:
+                resolved.append(name)
+            else:
+                unknown.append(t)
+        if unknown:
+            import logging
+            logging.getLogger(__name__).warning(
+                "ToolSimulator: no schema for %s — these tools will NOT be offered to the model",
+                ", ".join(sorted(set(unknown))))
+        gated = [t for t in resolved if t not in CORE_TOOLS]
         self.enabled_tools = CORE_TOOLS + gated
         self.rag_client = rag_client
         self._irrelevant_count = 0
@@ -151,6 +215,9 @@ class ToolSimulator:
         if tool_name == "date_calculator":
             return _compute_date(args.get("expression", ""))
 
+        # warm_transfer_call is TERMINAL here: the call leaves the agent for a human,
+        # and the supervisor leg is verified outside this system. Nothing after it is
+        # the agent-under-test's behaviour, so the evaluated conversation stops.
         if tool_name == "irrelevant_interruption":
             self._irrelevant_count += 1
             return f"Handled irrelevant interruption (count={self._irrelevant_count})"
