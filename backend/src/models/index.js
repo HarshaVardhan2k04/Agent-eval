@@ -2,11 +2,6 @@
 const sequelize = require('../config/database');
 const { DataTypes } = require('sequelize');
 
-// Prompt Eval (existing tables)
-const Eval = require('./Eval')(sequelize, DataTypes);
-const PromptVersion = require('./PromptVersion')(sequelize, DataTypes);
-const ScenarioResult = require('./ScenarioResult')(sequelize, DataTypes);
-const EvalEvent = require('./EvalEvent')(sequelize, DataTypes);
 
 // Test STT
 const SttBatch = require('./SttBatch')(sequelize, DataTypes);
@@ -37,14 +32,8 @@ const ForgeSim = require('./ForgeSim')(sequelize, DataTypes);
 const ForgeLlm = require('./ForgeLlm')(sequelize, DataTypes);
 
 // --- associations ---
-Eval.hasMany(PromptVersion, { foreignKey: 'eval_id', onDelete: 'CASCADE' });
-PromptVersion.belongsTo(Eval, { foreignKey: 'eval_id' });
 
-Eval.hasMany(ScenarioResult, { foreignKey: 'eval_id', onDelete: 'CASCADE' });
-ScenarioResult.belongsTo(Eval, { foreignKey: 'eval_id' });
 
-Eval.hasMany(EvalEvent, { foreignKey: 'eval_id', onDelete: 'CASCADE' });
-EvalEvent.belongsTo(Eval, { foreignKey: 'eval_id' });
 
 SttBatch.hasMany(SttResult, { foreignKey: 'batch_id', onDelete: 'CASCADE' });
 SttResult.belongsTo(SttBatch, { foreignKey: 'batch_id' });
@@ -60,10 +49,6 @@ ForgeEvent.belongsTo(ForgeRun, { foreignKey: 'run_id' });
 
 module.exports = {
   sequelize,
-  Eval,
-  PromptVersion,
-  ScenarioResult,
-  EvalEvent,
   SttBatch,
   SttResult,
   CallBatch,

@@ -1,11 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AppShell } from './components/AppShell'
-import { EvalListPage } from './pages/EvalListPage'
-import { EvalSetupPage } from './pages/EvalSetupPage'
-import { EvalProgressPage } from './pages/EvalProgressPage'
-import { ResultsDashboard } from './pages/ResultsDashboard'
-import { PromptHistoryPage } from './pages/PromptHistoryPage'
-import { VoiceReportPage } from './pages/VoiceReportPage'
 import { SttPage } from './pages/SttPage'
 import { RagTestPage } from './pages/RagTestPage'
 import { AnalyzeCallsPage } from './pages/AnalyzeCallsPage'
@@ -30,6 +24,7 @@ function App() {
     <BrowserRouter>
       <Routes>
         <Route element={<AppShell />}>
+          <Route path="/" element={<Navigate to="/forge" replace />} />
           {/* Forge (promptforge optimizer — supersedes Prompt Eval) */}
           <Route path="/forge" element={<ForgeListPage />} />
           <Route path="/forge/new" element={<ForgeSetupPage />} />
@@ -44,12 +39,6 @@ function App() {
           <Route path="/forge/:id/review" element={<ForgeHumanReviewPage />} />
 
           {/* Old Eval (legacy Prompt Eval — read-only path) */}
-          <Route path="/" element={<EvalListPage />} />
-          <Route path="/new" element={<EvalSetupPage />} />
-          <Route path="/eval/:id/progress" element={<EvalProgressPage />} />
-          <Route path="/eval/:id/results" element={<ResultsDashboard />} />
-          <Route path="/eval/:id/prompts" element={<PromptHistoryPage />} />
-          <Route path="/eval/:id/voice" element={<VoiceReportPage />} />
 
           {/* Call Analysis */}
           <Route path="/analyze" element={<AnalyzeCallsPage />} />

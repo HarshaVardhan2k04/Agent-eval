@@ -1,7 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from src.api.routes import router
 from src.api.stt_routes import router as stt_router
 from src.api.analysis_routes import router as analysis_router
 from src.api.flow_routes import router as flow_router
@@ -18,7 +17,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(router)
 app.include_router(stt_router)
 app.include_router(analysis_router)
 app.include_router(flow_router)

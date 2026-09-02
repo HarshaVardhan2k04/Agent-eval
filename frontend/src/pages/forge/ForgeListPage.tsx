@@ -73,8 +73,19 @@ export function ForgeListPage() {
               color: filter === f.key ? T.text : T.muted, fontWeight: filter === f.key ? 600 : 500,
             }}>{f.label}</button>
         ))}
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search runs…"
-          style={{ marginLeft: 'auto', padding: '7px 13px', borderRadius: 99, background: T.well, border: `1px solid ${T.border2}`, color: T.text, fontSize: 13, outline: 'none', width: 210 }} />
+        {/* same search pill as the Evaluations page — magnifier + name/ID search */}
+        <div style={{ marginLeft: 'auto', position: 'relative', flex: 1, minWidth: 220, maxWidth: 360 }}>
+          <span style={{ position: 'absolute', left: 17, top: '50%', transform: 'translateY(-50%)', pointerEvents: 'none', zIndex: 1, display: 'flex' }}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#9a9080" strokeWidth="2.2" strokeLinecap="round">
+              <circle cx="11" cy="11" r="7" />
+              <line x1="16.6" y1="16.6" x2="21" y2="21" />
+            </svg>
+          </span>
+          <input
+            value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by name or ID…"
+            style={{ width: '100%', padding: '13px 20px 13px 44px', borderRadius: 999, border: `1px solid ${T.border}`, background: 'linear-gradient(180deg,#2b241d,#17130f)', color: T.text, fontSize: 14, fontFamily: 'inherit', boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.07),inset 0 -12px 20px -12px rgba(0,0,0,0.75),0 10px 26px -12px rgba(0,0,0,0.85)' }}
+          />
+        </div>
       </div>
 
       {loading ? (

@@ -734,6 +734,24 @@ async function ingestForgeEvent(req, res) {
       if (data.composite != null) patch.final_composite = data.composite;
       if (data.solved_pct != null) patch.solved_pct = data.solved_pct;
       await ForgeRun.update(patch, { where: { id: runId } });
+      // CLOSE THE LOOP: an ACCEPTED fix teaches the global matrix. The lever that just
+      // worked is written back onto every problem this version targeted and flipped to
+      // Y, so the next run on any agent starts from a proven cure instead of rediscovering
+      // it. A curated winning_lever is never overwritten — the new text lands in
+      // how_solved, and only fills winning_lever when that column is still empty.
+      if (data.status === 'accepted' && data.how_solved && data.targeted_problem) {
+        const solved = String(data.targeted_problem).split('+')
+          .map((x) => x.trim()).filter(Boolean)
+          .filter((pid) => (data.statuses || {})[pid]?.verdict === 'Y');
+        for (const pid of solved) {
+          const prob = await ForgeProblem.findByPk(pid);
+          if (!prob) continue;
+          const up = { how_solved: data.how_solved, updated_at: new Date() };
+          if (!prob.winning_lever) up.winning_lever = data.how_solved;
+          await prob.update(up);
+        }
+        if (solved.length) console.log(`[forge] matrix learned from ${runId}: ${solved.join(', ')}`);
+      }
     } else if (event_type === 'escalation_raised') {
       const run = await ForgeRun.findByPk(runId);
       if (run) {
