@@ -3,11 +3,17 @@
 // The backend owns persistence; the Python engine owns compute and streams events back
 // to POST /api/internal/forge-events.
 const { nanoid } = require('nanoid');
-const { Op } = require('sequelize');
-const { ForgeRun, ForgeProblem, ForgeVersion, ForgeEvent, ForgeDataset, ForgeArena, ForgeSim, ForgeLlm } = require('../models');
+const { Op, literal } = require('sequelize');
+const { ForgeRun, ForgeProblem, ForgeVersion, ForgeEvent, ForgeDataset, ForgeArena, ForgeSim, ForgeLlm,
+  ForgeSavedPrompt } = require('../models');
 const agentDb = require('../services/agentDbClient');
 const forgeEngine = require('../services/forgeEngineClient');
 const verticalSource = require('../services/verticalSource');
+
+// Problem ids are VARCHAR ('p7'), so a plain ORDER BY id gives p1, p10, p11 ... p2 —
+// which is what every dropdown and list built on this endpoint then showed. Order by
+// the numeric part so the catalogue always reads p1, p2, p3 ... p43.
+const PROBLEM_ORDER = [[literal("NULLIF(regexp_replace(id, '\\D', '', 'g'), '')::int"), 'ASC'], ['id', 'ASC']];
 
 const DEFAULT_SCORING = {
   best_of_n: 1, votes: 3, confirm_votes: 5, gate_pct: 95, stress_target: 120, milestone_every: 2,
@@ -99,19 +105,114 @@ async function deleteLlm(req, res) {
   res.json({ deleted: true });
 }
 
+// ---- saved prompt library --------------------------------------------------
+// Prompts worth keeping, linked to the problems they solve. Linking stores an
+// EXCERPT as a reference on the problem: handing the coach a whole 58k-char prompt
+// is useless to it, the four lines that fix p7 are not.
+
+async function listSavedPrompts(_req, res) {
+  res.json(await ForgeSavedPrompt.findAll({
+    attributes: ['id', 'name', 'kind', 'vertical', 'notes', 'problem_ids', 'created_at', 'updated_at'],
+    order: [['created_at', 'DESC']],
+  }));
+}
+
+async function getSavedPrompt(req, res) {
+  const row = await ForgeSavedPrompt.findByPk(req.params.id);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  res.json(row);
+}
+
+async function createSavedPrompt(req, res) {
+  const b = req.body || {};
+  if (!b.name || (!b.body_text && !b.body_json)) {
+    return res.status(400).json({ error: 'name and body_text (or body_json) required' });
+  }
+  res.json(await ForgeSavedPrompt.create({
+    id: nanoid(10), name: String(b.name).trim(), kind: b.kind || 'blob',
+    body_text: b.body_text || null, body_json: b.body_json || null,
+    vertical: b.vertical || null, notes: b.notes || null,
+    problem_ids: Array.isArray(b.problem_ids) ? b.problem_ids : [],
+  }));
+}
+
+async function updateSavedPrompt(req, res) {
+  const row = await ForgeSavedPrompt.findByPk(req.params.id);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  const b = req.body || {};
+  const patch = { updated_at: new Date() };
+  for (const k of ['name', 'kind', 'body_text', 'vertical', 'notes']) if (k in b) patch[k] = b[k];
+  if ('body_json' in b) patch.body_json = b.body_json;
+  if (Array.isArray(b.problem_ids)) patch.problem_ids = b.problem_ids;
+  await row.update(patch);
+  res.json(row);
+}
+
+async function deleteSavedPrompt(req, res) {
+  await ForgeSavedPrompt.destroy({ where: { id: req.params.id } });
+  res.json({ deleted: true });
+}
+
+// Link a saved prompt to a problem, carrying the excerpt that actually does the work.
+// The excerpt lands on the PROBLEM as a reference, which is what the coach reads.
+async function linkSavedPrompt(req, res) {
+  const { id, problemId } = req.params;
+  const b = req.body || {};
+  const sp = await ForgeSavedPrompt.findByPk(id);
+  if (!sp) return res.status(404).json({ error: 'saved prompt not found' });
+  const prob = await ForgeProblem.findByPk(problemId);
+  if (!prob) return res.status(404).json({ error: 'problem not found' });
+
+  const excerpt = String(b.excerpt || sp.body_text || '').trim();
+  if (!excerpt) return res.status(400).json({ error: 'excerpt required (highlight the passage that fixes this problem)' });
+
+  const refs = Array.isArray(prob.references_json) ? [...prob.references_json] : [];
+  refs.push({
+    id: nanoid(6),
+    kind: b.kind || 'good_example',           // good_example | bad_example | layer_snapshot | note
+    title: b.title || `from ${sp.name}`,
+    body: excerpt.slice(0, 4000),
+    source: sp.name, saved_prompt_id: sp.id,
+    added_at: new Date().toISOString(),
+  });
+  await prob.update({ references_json: refs, updated_at: new Date() });
+
+  const linked = Array.isArray(sp.problem_ids) ? sp.problem_ids : [];
+  if (!linked.includes(problemId)) {
+    await sp.update({ problem_ids: [...linked, problemId], updated_at: new Date() });
+  }
+  res.json({ linked: true, problem_id: problemId, references: refs.length });
+}
+
+async function unlinkSavedPrompt(req, res) {
+  const { id, problemId } = req.params;
+  const prob = await ForgeProblem.findByPk(problemId);
+  if (prob) {
+    const refs = (prob.references_json || []).filter((r) => r.saved_prompt_id !== id);
+    await prob.update({ references_json: refs, updated_at: new Date() });
+  }
+  const sp = await ForgeSavedPrompt.findByPk(id);
+  if (sp) {
+    await sp.update({ problem_ids: (sp.problem_ids || []).filter((p) => p !== problemId), updated_at: new Date() });
+  }
+  res.json({ unlinked: true });
+}
+
 // ---- LLM Arena ------------------------------------------------------------
 // N hosted LLMs, each with its OWN prompt, one dataset, full battery, fixed judge.
 // Contestants run SEQUENTIALLY (one inference box) — the run_complete ingest
 // dispatches the next queued member; when all land, the winner is computed.
 
 async function applicableProblems({ vertical, mode, direction, language }) {
-  const all = await ForgeProblem.findAll();
+  const all = await ForgeProblem.findAll({ order: PROBLEM_ORDER });
   return all.map((p) => p.toJSON())
     .filter((p) => applies(p, { vertical, mode, direction, language }))
     .map((p) => ({
       id: p.id, behaviour: p.behaviour, layer_for_fix: p.layer_for_fix,
       has_detector: p.has_detector, filter_territory: p.filter_territory,
       winning_lever: p.winning_lever,
+      // worked examples the coach imitates — the lever says WHAT to do, these show HOW
+      references: Array.isArray(p.references_json) ? p.references_json : [],
     }));
 }
 
@@ -212,7 +313,7 @@ async function reevaluateArena(req, res) {
   const scoring = JSON.parse(JSON.stringify(arena.scoring_json || {}));
   scoring.judge = judge;
   await arena.update({ status: 'running', winner_run_id: null, ranking_json: [],
-                       completed_at: null, scoring_json: scoring });
+                       completed_at: null, scoring_json: scoring, updated_at: new Date() });
   const started = [];
   for (const run of runs) {
     const sims = await ForgeSim.findAll({
@@ -266,7 +367,7 @@ async function retryArenaContestant(req, res) {
   await ForgeVersion.destroy({ where: { run_id: run.id } });
   await run.update({ status: 'queued', error_message: null, solved_pct: null,
                      final_composite: null, current_version: 0, completed_at: null, updated_at: new Date() });
-  await arena.update({ status: 'running', winner_run_id: null, ranking_json: [], completed_at: null });
+  await arena.update({ status: 'running', winner_run_id: null, ranking_json: [], completed_at: null, updated_at: new Date() });
   try {
     await dispatchArenaContestant(arena, contestant);
   } catch (e) {
@@ -332,11 +433,48 @@ async function createArena(req, res) {
   res.json({ arena_id: arenaId, status: 'running', contestants: enriched.length });
 }
 
+// An arena is 'running' only while contestant runs are actually alive. Two ways it
+// can lie: the engine dies mid-dispatch and the runs never materialise, or every run
+// reached a terminal state but the completion ingest never fired (a restart between
+// the last run finishing and its callback). Either way the arena sits 'running'
+// forever and the UI shows a spinner nobody can clear. Reconcile on every read —
+// cheap, and the list page is exactly where a stale one is noticed.
+const LIVE_RUN_STATES = ['queued', 'collecting', 'optimizing'];
+
+// An arena is only stale if it has been untouched for a while. reevaluate() and
+// retry() set the arena to 'running' BEFORE the first contestant flips to a live
+// status, and a concurrent poll landing in that window would otherwise settle a
+// run that is just starting.
+const REAP_GRACE_MS = 90_000;
+
+async function reapStaleArenas() {
+  const live = await ForgeArena.findAll({ where: { status: 'running' } });
+  for (const arena of live) {
+    if (Date.now() - new Date(arena.updated_at || arena.created_at).getTime() < REAP_GRACE_MS) continue;
+    const runs = await ForgeRun.findAll({
+      where: { arena_id: arena.id }, attributes: ['id', 'status'],
+    });
+    if (!runs.length) {
+      // the contestant runs it names are gone — nothing can ever finish this arena
+      await arena.update({ status: 'failed', completed_at: new Date(), updated_at: new Date() });
+      console.warn(`[forge] reaped arena ${arena.id}: contestant runs no longer exist`);
+      continue;
+    }
+    if (runs.some((r) => LIVE_RUN_STATES.includes(r.status))) continue;  // genuinely live
+    // every run is terminal but the arena never closed — settle it now
+    const anyScored = runs.some((r) => !['failed', 'stopped'].includes(r.status));
+    await arena.update({ status: anyScored ? 'complete' : 'failed', completed_at: new Date(), updated_at: new Date() });
+    console.warn(`[forge] reaped arena ${arena.id}: all runs terminal, marked ${anyScored ? 'complete' : 'failed'}`);
+  }
+}
+
 async function listArenas(_req, res) {
+  await reapStaleArenas();
   res.json(await ForgeArena.findAll({ order: [['created_at', 'DESC']] }));
 }
 
 async function getArena(req, res) {
+  await reapStaleArenas();
   const arena = await ForgeArena.findByPk(req.params.id);
   if (!arena) return res.status(404).json({ error: 'not found' });
   const runs = await ForgeRun.findAll({
@@ -439,7 +577,7 @@ async function createRun(req, res) {
   }
 
   // applicable problems (denominator source) — filtered to this run's context.
-  const allProblems = await ForgeProblem.findAll();
+  const allProblems = await ForgeProblem.findAll({ order: PROBLEM_ORDER });
   const problems = allProblems
     .map((p) => p.toJSON())
     .filter((p) => applies(p, { vertical, mode, direction, language: b.language }))
@@ -447,6 +585,8 @@ async function createRun(req, res) {
       id: p.id, behaviour: p.behaviour, layer_for_fix: p.layer_for_fix,
       has_detector: p.has_detector, filter_territory: p.filter_territory,
       winning_lever: p.winning_lever,
+      // worked examples the coach imitates — the lever says WHAT to do, these show HOW
+      references: Array.isArray(p.references_json) ? p.references_json : [],
     }));
 
   // dataset: real (fetch transcripts read-only, engine mines+scrubs) or authored personas.
@@ -565,7 +705,7 @@ async function resolveCombos(req, res) {
     ? { layers: { addon: [], ...(snap.layers || {}) }, override_keys: snap.override_keys || {} }
     : { blob: snap.blob || '' };
 
-  const allProblems = await ForgeProblem.findAll();
+  const allProblems = await ForgeProblem.findAll({ order: PROBLEM_ORDER });
   const problems = allProblems.map((p) => p.toJSON()).map((p) => ({
     id: p.id, behaviour: p.behaviour, layer_for_fix: p.layer_for_fix,
     has_detector: p.has_detector, filter_territory: p.filter_territory, winning_lever: p.winning_lever,
@@ -922,13 +1062,13 @@ async function getSim(req, res) {
 // ---- global problem catalog (definitions) ---------------------------------
 
 async function listProblems(_req, res) {
-  res.json(await ForgeProblem.findAll({ order: [['id', 'ASC']] }));
+  res.json(await ForgeProblem.findAll({ order: PROBLEM_ORDER }));
 }
 
 async function patchProblem(req, res) {
   // Human-editable. filter_territory is human-ONLY by design (the coach can never set it).
   const allowed = ['behaviour', 'layer_for_fix', 'category', 'filter_territory', 'winning_lever',
-                   'how_solved', 'applicability_json', 'has_detector'];
+                   'how_solved', 'applicability_json', 'has_detector', 'references_json'];
   const patch = { updated_at: new Date() };
   for (const k of allowed) if (k in (req.body || {})) patch[k] = req.body[k];
   const [n] = await ForgeProblem.update(patch, { where: { id: req.params.id } });
@@ -1064,7 +1204,7 @@ async function evaluateRun(req, res) {
     try { champion.layers.campaign = JSON.parse(review.edited_prompt); } catch (_e) { /* keep as-is */ }
   }
 
-  const allProblems = await ForgeProblem.findAll();
+  const allProblems = await ForgeProblem.findAll({ order: PROBLEM_ORDER });
   const problems = allProblems.map((p) => p.toJSON()).map((p) => ({
     id: p.id, behaviour: p.behaviour, layer_for_fix: p.layer_for_fix,
     has_detector: p.has_detector, filter_territory: p.filter_territory, winning_lever: p.winning_lever,
@@ -1116,6 +1256,8 @@ async function exportRun(req, res) {
 }
 
 module.exports = {
+  listSavedPrompts, getSavedPrompt, createSavedPrompt, updateSavedPrompt, deleteSavedPrompt,
+  linkSavedPrompt, unlinkSavedPrompt,
   getCoachGuidance,
   setCoachGuidance,
   resolveCombos,

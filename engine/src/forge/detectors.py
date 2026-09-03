@@ -555,10 +555,59 @@ async def run_detector(engine, system_prompt, problem_id, greeting="", votes=3):
 
 # Purely mechanical checkers that are valid on ANY transcript (no scripted setup
 # needed): ok=True means the problem did NOT occur in this conversation.
+def _ck_tool_leak(convo, ended):
+    """p43 — the model TYPED a tool name instead of calling it.
+
+    Production strips the leaked text before TTS, so the caller hears a normal
+    sentence and nothing runs: the call never hangs up, the brochure never sends.
+    It is invisible in production logs and must be loud here. Scans every agent
+    turn for the four leak shapes the parser knows (xml / json / call-ish / bare).
+    """
+    # Match against EVERY known tool name, not just the ones this run offered: a voice
+    # agent saying "send_whatsapp_template" out loud is wrong either way, and a bare
+    # name is only recognisable with a name list to match on.
+    known = list(TOOL_DEFINITIONS.keys())
+    for i, t in _agent_entries(convo):
+        leaks = tparse.find_leaks(t or "", known)
+        if leaks:
+            names = ", ".join(sorted({l["name"] for l in leaks}))
+            return False, f"spoke tool name(s) {names} instead of calling", i
+    return True, "no tool name was ever spoken instead of called", None
+
+
+def _sk_tool_leak(sim, convo):
+    """Same question as _ck_tool_leak, but with the stored sim available.
+
+    The recorded leaks are authoritative: they were matched against the tools THIS
+    run actually offered, so a bare tool name is unambiguous there. Falls back to
+    the text scan when a sim carries no leak record (older rows, or a path that
+    never populated it).
+    """
+    leaks = (sim or {}).get("tool_leaks") or []
+    if leaks:
+        names = ", ".join(sorted({l.get("name", "?") for l in leaks}))
+        return False, f"spoke tool name(s) {names} instead of calling", None
+    return _ck_tool_leak(convo, None)
+
+
+# Checkers that only need the conversation.
 MECHANICAL_CHECKERS = {
     "p2": _ck_over_ack, "p3": _ck_repetition, "p15": _ck_numbers,
-    "p29": _ck_lang_drift, "p30": _ck_formatting,
+    "p29": _ck_lang_drift, "p30": _ck_formatting, "p43": _ck_tool_leak,
 }
+
+# Checkers that want the STORED SIM as well (tool calls, leaks, metadata) — richer
+# than the transcript alone. Registered here beside every other detector so the
+# runner never names a problem id: it just asks whether one is registered.
+# Signature: (sim, convo) -> (ok, reason, failing_turn)
+SIM_CHECKERS = {
+    "p43": _sk_tool_leak,
+}
+
+# Problems whose verdict IS a deepeval metric score. Registered here with every other
+# detector so the runner never names a problem id — renumbering the catalogue (which
+# has already happened once, p1-p42) must not require touching the runner.
+METRIC_DETECTORS = {"p40": "faithfulness", "p41": "self_consistency", "p42": "answer_relevancy"}
 
 _OBS_JUDGE_SYS = (
     "You are a strict QA rater for a voice-agent transcript. You are checking whether ONE "

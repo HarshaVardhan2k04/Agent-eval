@@ -246,6 +246,29 @@ export const api = {
   patchForgeProblem(id: string, patch: Record<string, unknown>) {
     return request(`/api/forge/problems/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })
   },
+  // Saved prompt library — prompts worth keeping, linkable to the problems they fix
+  listSavedPrompts() {
+    return request('/api/forge/saved-prompts')
+  },
+  getSavedPrompt(id: string) {
+    return request(`/api/forge/saved-prompts/${id}`)
+  },
+  createSavedPrompt(body: Record<string, unknown>) {
+    return request('/api/forge/saved-prompts', { method: 'POST', body: JSON.stringify(body) })
+  },
+  patchSavedPrompt(id: string, patch: Record<string, unknown>) {
+    return request(`/api/forge/saved-prompts/${id}`, { method: 'PATCH', body: JSON.stringify(patch) })
+  },
+  deleteSavedPrompt(id: string) {
+    return request(`/api/forge/saved-prompts/${id}`, { method: 'DELETE' })
+  },
+  // linking stores the EXCERPT on the problem as a reference the coach reads
+  linkSavedPrompt(id: string, problemId: string, body: Record<string, unknown>) {
+    return request(`/api/forge/saved-prompts/${id}/link/${problemId}`, { method: 'POST', body: JSON.stringify(body) })
+  },
+  unlinkSavedPrompt(id: string, problemId: string) {
+    return request(`/api/forge/saved-prompts/${id}/link/${problemId}`, { method: 'DELETE' })
+  },
   // Layer library — READ-ONLY list from agent_db_dev.prompts (same Postgres)
   listForgeLayers(type: string): Promise<{ configured: boolean; db_name: string; rows: { id: string; prompt_type: string; friendly_name: string }[]; error?: string }> {
     return request(`/api/forge/layers?type=${encodeURIComponent(type)}`)

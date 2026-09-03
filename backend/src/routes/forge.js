@@ -54,6 +54,15 @@ router.post('/datasets', c.createDataset);
 router.delete('/datasets/:id', c.deleteDataset);
 
 // global problem catalog (definitions)
+// saved prompt library + problem linking
+router.get('/saved-prompts', c.listSavedPrompts);
+router.post('/saved-prompts', c.createSavedPrompt);
+router.get('/saved-prompts/:id', c.getSavedPrompt);
+router.patch('/saved-prompts/:id', c.updateSavedPrompt);
+router.delete('/saved-prompts/:id', c.deleteSavedPrompt);
+router.post('/saved-prompts/:id/link/:problemId', c.linkSavedPrompt);
+router.delete('/saved-prompts/:id/link/:problemId', c.unlinkSavedPrompt);
+
 router.get('/problems', c.listProblems);
 router.post('/problems', c.addProblem);
 router.patch('/problems/:id', c.patchProblem);

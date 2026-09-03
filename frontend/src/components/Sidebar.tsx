@@ -4,7 +4,7 @@ import { T } from '../theme'
 import { ThemePicker } from './ThemePicker'
 import {
   IconPlus, IconAnalyze, IconBoard, IconStt, IconFlow,
-  IconJudge, IconChevron, IconRag, IconSwords,
+  IconJudge, IconChevron, IconRag, IconSwords, IconBook,
 } from './icons'
 
 type Item = { to: string; label: string; icon: (p: { s?: number }) => ReactNode; end?: boolean }
@@ -17,6 +17,7 @@ const GROUPS: Group[] = [
       { to: '/forge', label: 'Runs', icon: IconJudge, end: true },
       { to: '/forge/new', label: 'New Run', icon: IconPlus },
       { to: '/forge/matrix', label: 'Problem Matrix', icon: IconBoard },
+      { to: '/forge/saved-prompts', label: 'Saved prompts', icon: IconBook },
       { to: '/forge/arena', label: 'LLM Arena', icon: IconSwords },
     ],
   },

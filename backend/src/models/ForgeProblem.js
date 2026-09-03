@@ -14,6 +14,8 @@ module.exports = (sequelize, DataTypes) =>
       how_solved: { type: DataTypes.TEXT, allowNull: true },
       // { verticals:[], modes:[], languages:[], directions:[] } — empty = applies everywhere
       applicability_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+      // worked examples fed to the coach — see forge_saved_prompts linking
+      references_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
       has_detector: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
       source: { type: DataTypes.TEXT, allowNull: true }, // matrix_csv | catalog | discovered
       created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },

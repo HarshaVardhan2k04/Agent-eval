@@ -715,3 +715,238 @@ export function CoachGuidancePanel({ runId, live }: { runId: string; live?: bool
     </div>
   )
 }
+
+// ── LIVE STATUS ─────────────────────────────────────────────────────────────
+// "What is happening right now", in words, so the run is readable without
+// parsing the log. Every stage below maps 1:1 to something runner.py actually
+// emits (a progress `phase`, iteration_start, or an iteration_note) — nothing
+// here is guessed, and an unknown phase falls through to its raw name rather
+// than silently showing a stale stage.
+const STAGE_META: Record<string, { title: string; blurb: string; color: string }> = {
+  starting: { title: 'Starting up', blurb: 'Loading the problem set and assembling the prompt under test.', color: T.blue },
+  tool_checks: { title: 'Checking the tools fire', blurb: 'Each tool is dropped into a situation that should trigger it, in several phrasings — does the model actually call it, or just talk about it?', color: T.purple },
+  tool_fix: { title: 'Fixing a tool that never fired', blurb: 'Coaching the prompt for that one tool, then re-running its checks. The edit is kept only if the tool now fires on every phrasing.', color: T.purple },
+  conversations: { title: 'Simulating conversations', blurb: 'Role-playing leads against the prompt. Nothing is graded yet — every conversation is stored first, then judged.', color: 'var(--accent)' },
+  judging: { title: 'Judging the conversations', blurb: 'The judge reads each finished conversation and rules whether the problem showed up.', color: T.amber },
+  confirm_convos: { title: 'Deep-confirming the passes', blurb: 'Re-running everything that passed, many more times over. A 3/3 pass proves nothing.', color: T.amber },
+  stress: { title: 'Stress testing', blurb: 'Hundreds of free-form persona × mood calls. No judge and no script — five habits are measured in code across every agent turn: yapping, bot-words, spoken digits, formatting characters, repeat loops.', color: T.purple },
+  deepeval: { title: 'Scoring quality', blurb: 'Faithfulness, answer relevancy and self-consistency, measured over those same conversations.', color: T.blue },
+  coaching: { title: 'Coaching the prompt', blurb: 'Rewriting one layer to fix one problem — then re-testing to see whether the fix actually held.', color: 'var(--accent)' },
+  parked: { title: 'Waiting on you', blurb: 'The coach parked a question it will not answer on its own. Answer it to unblock those problems.', color: T.purple },
+  done: { title: 'Finished', blurb: 'The run is over.', color: T.green },
+}
+
+// How a finished run is described. A failed run must SAY failed — "Finished" over a
+// crash reads like success, and the reason strip sits right underneath.
+const TERMINAL_META: Record<string, { title: string; blurb: string; color: string }> = {
+  failed: { title: 'Run failed', blurb: 'The run stopped on an error before it could finish. The reason is below — anything already stored is still on the Simulations page.', color: T.red },
+  stopped: { title: 'Stopped by you', blurb: 'Everything the run had already stored is kept.', color: T.amber },
+  llm_complete: { title: 'LLM-complete', blurb: 'The gate was reached. A human still has to take the prompt the rest of the way.', color: T.green },
+  converged_below_gate: { title: 'Converged below the gate', blurb: 'The coach ran out of moves before reaching the gate. The problems still open are in the results.', color: T.amber },
+  awaiting_human: { title: 'Waiting on you', blurb: 'The run is paused on something it will not decide by itself.', color: T.purple },
+  finalized: { title: 'Finalized', blurb: 'A human has signed this prompt off.', color: T.green },
+}
+
+// The visible spine of a run, in the order runner.py walks it.
+const PIPELINE: [string, string][] = [
+  ['tool_checks', 'Tools'],
+  ['conversations', 'Conversations'],
+  ['judging', 'Judging'],
+  ['confirm_convos', 'Confirm'],
+  ['stress', 'Stress'],
+  ['deepeval', 'Metrics'],
+  ['coaching', 'Coaching'],
+]
+
+type ForgeEventLike = { event_type: string; event_data: Record<string, unknown>; created_at: string }
+
+type NowState = {
+  key: string
+  done: number | null
+  total: number | null
+  detail: string
+  note: string
+  target: string | null
+  layer: string | null
+  attempt: number | null
+  combo: string | null
+  since: number | null
+  seen: Set<string>
+}
+
+const str = (v: unknown) => (v == null ? '' : String(v))
+
+function deriveNow(events: ForgeEventLike[]): NowState {
+  const n: NowState = { key: 'starting', done: null, total: null, detail: '', note: '',
+    target: null, layer: null, attempt: null, combo: null, since: null, seen: new Set() }
+  const enter = (k: string, at: string) => {
+    if (n.key !== k || n.since == null) {
+      n.since = new Date(at).getTime(); n.done = null; n.total = null; n.detail = ''
+    }
+    n.key = k
+    n.seen.add(k)
+  }
+  for (const e of events) {
+    const d: Record<string, unknown> = e.event_data || {}
+    switch (e.event_type) {
+      case 'run_start': {
+        enter('starting', e.created_at)
+        const gate = d.n_problems ? `${str(d.n_problems)} problems in the gate` : ''
+        n.detail = [n.detail, gate].filter(Boolean).join(' · ')
+        break
+      }
+      case 'probes_ready': {
+        enter('starting', e.created_at)
+        const ds = d.n ? `${str(d.n)} persona${d.n === 1 ? '' : 's'}${d.source ? ` · ${str(d.source)}` : ''}` : ''
+        n.detail = [n.detail, ds].filter(Boolean).join(' · ')
+        break
+      }
+      case 'progress':
+        enter(str(d.phase) || 'starting', e.created_at)
+        n.done = typeof d.done === 'number' ? d.done : n.done
+        n.total = typeof d.total === 'number' ? d.total : n.total
+        n.detail = d.problem_id
+          ? `${str(d.problem_id)}${d.verdict ? ` → ${str(d.verdict)}` : ''}`
+          : str(d.probe)
+        break
+      case 'iteration_start':
+        enter('coaching', e.created_at)
+        n.target = str(d.targeted_problem) || null
+        n.attempt = typeof d.attempt === 'number' ? d.attempt : null
+        break
+      case 'iteration_note': {
+        const note = str(d.note)
+        n.note = note
+        if (/^coaching \S+:/.test(note)) enter('tool_fix', e.created_at)
+        const m = note.match(/^combo (\d+\/\d+) — (\S+?):/)
+        if (m) n.combo = `${m[2]} (${m[1]})`
+        break
+      }
+      case 'version_recorded':
+        n.layer = str(d.layer_for_fix) || n.layer
+        break
+      case 'escalation_raised':
+        enter('parked', e.created_at)
+        n.detail = str(d.question).slice(0, 90)
+        break
+      case 'run_complete':
+        enter('done', e.created_at)
+        n.detail = d.solved_pct != null ? `${str(d.solved_pct)}% solved` : ''
+        break
+    }
+  }
+  return n
+}
+
+function humanDur(ms: number) {
+  const s = Math.max(0, Math.round(ms / 1000))
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ${s % 60}s`
+  return `${Math.floor(m / 60)}h ${m % 60}m`
+}
+
+export function LiveStatusPanel({ events, runStatus, live }: {
+  events: ForgeEventLike[]
+  runStatus: string
+  live: boolean
+}) {
+  const now = deriveNow(events)
+  // A ticking clock so "elapsed" advances between events, not only when one lands.
+  // Seeded to 0 rather than Date.now() — reading the clock during render is impure,
+  // and the first interval fills it in a second later.
+  const [tick, setTick] = useState(0)
+  useEffect(() => {
+    if (!live) return
+    const iv = setInterval(() => setTick(Date.now()), 1000)
+    return () => clearInterval(iv)
+  }, [live])
+
+  const key = live ? now.key : 'done'
+  const meta = (live ? STAGE_META[key] : TERMINAL_META[runStatus])
+    || STAGE_META[key]
+    || { title: key.replace(/_/g, ' '), blurb: '', color: T.blue }
+  const pct = now.total ? Math.min(100, Math.round((now.done || 0) / now.total * 100)) : null
+  const elapsed = now.since && tick ? tick - now.since : null
+
+  // ETA straight from the observed rate of THIS stage — no model, no fudge
+  let eta: string | null = null
+  if (live && pct != null && now.done && now.done >= 3 && elapsed && now.total) {
+    const perItem = elapsed / now.done
+    const left = (now.total - now.done) * perItem
+    if (left > 1500) eta = `~${humanDur(left)} left`
+  }
+
+  const curIdx = PIPELINE.findIndex(([k]) => k === key)
+
+  return (
+    <div style={{ ...card, padding: 0, marginTop: 16, overflow: 'hidden', display: 'flex' }}>
+      <div style={{ width: 4, background: meta.color, flexShrink: 0 }} />
+      <div style={{ padding: '15px 18px', flex: 1, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          {live && <span className="pulse-dot" style={{ width: 9, height: 9, borderRadius: 99, background: meta.color, flexShrink: 0 }} />}
+          <span style={{ fontSize: 17, fontWeight: 650, color: T.text }}>{meta.title}</span>
+          {now.attempt != null && now.attempt > 0 && (
+            <span style={{ fontSize: 11.5, color: T.faint, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+              iteration {now.attempt}
+            </span>
+          )}
+          {now.target && <LayerBadge layer={now.layer} />}
+          {now.target && <span style={{ fontFamily: T.mono, fontSize: 12.5, color: T.text2 }}>fixing {now.target}</span>}
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12, fontSize: 12.5, color: T.faint }}>
+            {now.total != null && (
+              <span style={{ fontFamily: T.mono, color: T.text2 }}>{now.done ?? 0} / {now.total}</span>
+            )}
+            {eta && <span>{eta}</span>}
+            {elapsed != null && <span>{humanDur(elapsed)}</span>}
+          </div>
+        </div>
+
+        <div style={{ fontSize: 13, color: T.muted, marginTop: 6, lineHeight: 1.5 }}>{meta.blurb}</div>
+
+        {pct != null && (
+          <div style={{ marginTop: 11, height: 6, borderRadius: 99, background: T.track, overflow: 'hidden' }}>
+            <div style={{ width: `${pct}%`, height: '100%', background: meta.color, borderRadius: 99, transition: 'width .4s ease' }} />
+          </div>
+        )}
+
+        {(now.detail || now.combo || now.note) && (
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
+            {now.combo && <Pill text={now.combo} mono />}
+            {now.detail && <Pill text={now.detail} mono />}
+            {now.note && !now.detail && <Pill text={now.note.slice(0, 90)} />}
+          </div>
+        )}
+
+        {/* the spine — which stages this run has already been through */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 13, flexWrap: 'wrap' }}>
+          {PIPELINE.map(([k, lbl], i) => {
+            const isCur = k === key
+            const isPast = curIdx >= 0 ? i < curIdx : now.seen.has(k)
+            const c = isCur ? meta.color : isPast ? T.text3 : T.fainter
+            return (
+              <span key={k} style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                {i > 0 && <span style={{ color: T.fainter, fontSize: 10 }}>›</span>}
+                <span style={{
+                  fontSize: 11, color: c, fontWeight: isCur ? 700 : 500,
+                  padding: isCur ? '2px 8px' : '2px 0', borderRadius: 99,
+                  background: isCur ? meta.color + '1f' : 'transparent',
+                }}>{lbl}</span>
+              </span>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function Pill({ text, mono }: { text: string; mono?: boolean }) {
+  return (
+    <span style={{
+      padding: '3px 9px', borderRadius: 99, background: T.chip, color: T.text3,
+      fontSize: 11.5, fontFamily: mono ? T.mono : undefined,
+      maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+    }}>{text}</span>
+  )
+}

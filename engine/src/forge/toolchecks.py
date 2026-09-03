@@ -189,7 +189,7 @@ VERDICT_BEHAVIOUR = {
 }
 
 
-def as_coach_problem(tool, roll, evidence=""):
+def as_coach_problem(tool, roll, evidence="", references=None):
     """Shape a failing tool check like a problem-matrix row so the existing coach
     (which already takes {id, behaviour, evidence, lever}) can fix it."""
     verdict = (roll or {}).get("verdict")
@@ -199,6 +199,7 @@ def as_coach_problem(tool, roll, evidence=""):
         "evidence": evidence or f"{(roll or {}).get('called', 0)}/{(roll or {}).get('n', 0)} phrasings called it",
         "layer_for_fix": "campaign",
         "lever": TOOL_LEVERS.get(tool, ""),
+        "references": list(references or []),
     }
 
 

@@ -68,6 +68,46 @@ HOW TO WORK
 
 Reply with strict JSON only. No prose outside the JSON."""
 
+# A reference is a passage that ALREADY WORKED on this problem. A model imitates a
+# concrete example far more reliably than it follows an abstract rule, so references
+# are the strongest signal we can give the coach — but they cost prompt budget, and
+# they carry another client's facts. Hence a hard cap and an explicit no-copy rule.
+_REF_BUDGET_CHARS = 3000
+_REF_MAX = 4
+
+
+def _references_block(refs):
+    """Render at most _REF_MAX references inside _REF_BUDGET_CHARS.
+
+    Good examples first (imitate this), then bad ones (avoid this) — a contrastive
+    pair teaches more than either alone. Truncation is marked so the coach never
+    treats a cut-off passage as a complete rule.
+    """
+    if not refs:
+        return "  (none recorded)"
+    order = {"good_example": 0, "bad_example": 1, "layer_snapshot": 2, "note": 3}
+    ranked = sorted(refs, key=lambda r: order.get(r.get("kind"), 9))[:_REF_MAX]
+    lines, spent = [], 0
+    for r in ranked:
+        body = str(r.get("body") or "").strip()
+        if not body:
+            continue
+        room = _REF_BUDGET_CHARS - spent
+        if room <= 200:
+            lines.append("  … (further references omitted to stay within budget)")
+            break
+        if len(body) > room:
+            body = body[:room].rstrip() + " …[truncated]"
+        kind = r.get("kind", "note")
+        verb = ("IMITATE THIS" if kind == "good_example"
+                else "AVOID THIS" if kind == "bad_example" else "FOR CONTEXT")
+        title = r.get("title") or kind
+        src = f" (from {r['source']})" if r.get("source") else ""
+        lines.append(f"  [{verb}] {title}{src}:\n  \"\"\"{body}\"\"\"")
+        spent += len(body)
+    return "\n".join(lines) if lines else "  (none recorded)"
+
+
 _STANDALONE_TMPL = """{layer_purpose}
 
 MODE: standalone (a single prompt blob — no layers). Edit the blob directly.
@@ -77,6 +117,13 @@ THE ONE PROBLEM TO FIX NOW:
   behaviour: {behaviour}
   observed: {evidence}
   proven lever (reuse if it fits): {lever}
+
+WORKED EXAMPLES FOR THIS PROBLEM:
+{references}
+  How to use these: copy the STRUCTURE, PHRASING and POSITIONING that made them work.
+  NEVER copy company names, places, prices or any other fact out of them — those belong
+  to a different agent. If a reference conflicts with the current prompt's facts, the
+  current prompt's facts win.
 
 CURRENT PROMPT (blob):
 {current_prompt}
@@ -107,6 +154,13 @@ THE ONE PROBLEM TO FIX NOW:
   observed: {evidence}
   catalog's suggested layer: {suggested_layer}
   proven lever (reuse if it fits): {lever}
+
+WORKED EXAMPLES FOR THIS PROBLEM:
+{references}
+  How to use these: copy the STRUCTURE, PHRASING and POSITIONING that made them work.
+  NEVER copy company names, places, prices or any other fact out of them — those belong
+  to a different agent. If a reference conflicts with the current layers' facts, the
+  current layers win.
 
 CURRENT LAYERS (JSON):
   campaign: {campaign_json}
@@ -177,6 +231,7 @@ class Coach:
             layer_purpose=LAYER_PURPOSE,
             problem_id=problem.get("id"), behaviour=problem.get("behaviour", ""),
             evidence=problem.get("evidence", ""), lever=problem.get("lever") or "(none recorded)",
+            references=_references_block(problem.get("references")),
             current_prompt=str(current_prompt)[:8000],
             revert_feedback=_revert_feedback(revert_history),
             guidance=_guidance_block(guidance),
@@ -196,6 +251,7 @@ class Coach:
             evidence=problem.get("evidence", ""),
             suggested_layer=problem.get("layer_for_fix") or "(unknown)",
             lever=problem.get("lever") or "(none recorded)",
+            references=_references_block(problem.get("references")),
             campaign_json=_json.dumps(campaign)[:6000],
             universal_ref=_json.dumps(layers.get("universal", {}))[:1500],
             vertical_ref=_json.dumps(layers.get("vertical", {}))[:1500],

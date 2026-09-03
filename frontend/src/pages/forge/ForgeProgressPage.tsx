@@ -4,7 +4,7 @@ import { T, card, label, verdictMeta } from '../../theme'
 import { api } from '../../api/client'
 import { useForgeStore } from '../../stores/forgeStore'
 import { RunStatusChip, LayerBadge, SolvedGauge, EscalationCard, VerdictCell,
-  ComboGate, CoachGuidancePanel, ComboScorecard } from '../../components/forge'
+  ComboGate, CoachGuidancePanel, ComboScorecard, LiveStatusPanel } from '../../components/forge'
 
 type Ev = { id: number; event_type: string; event_data: Record<string, any>; created_at: string }
 
@@ -121,6 +121,8 @@ export function ForgeProgressPage() {
       <p style={{ fontSize: 13, color: T.muted, margin: '6px 0 0' }}>
         v{run.current_version} · {run.mode} · {run.solved_pct != null ? `${run.solved_pct}% of ${denom ?? '—'} problems solved` : 'baseline running'} · gate {gate}%
       </p>
+
+      <LiveStatusPanel events={events} runStatus={run.status} live={isLive} />
 
       {run.status === 'awaiting_human' && ((run as any).combos_json?.blocked || []).length > 0 && (
         <div style={{ marginTop: 18 }}>

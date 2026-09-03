@@ -14,6 +14,7 @@ import { ForgeSetupPage } from './pages/forge/ForgeSetupPage'
 import { ForgeProgressPage } from './pages/forge/ForgeProgressPage'
 import { ForgeResultsPage } from './pages/forge/ForgeResultsPage'
 import { ForgeMatrixPage } from './pages/forge/ForgeMatrixPage'
+import { ForgeSavedPromptsPage } from './pages/forge/ForgeSavedPromptsPage'
 import { ForgeVersionsPage } from './pages/forge/ForgeVersionsPage'
 import { ForgeHumanReviewPage } from './pages/forge/ForgeHumanReviewPage'
 import { ForgeArenaPage } from './pages/forge/ForgeArenaPage'
@@ -29,6 +30,7 @@ function App() {
           <Route path="/forge" element={<ForgeListPage />} />
           <Route path="/forge/new" element={<ForgeSetupPage />} />
           <Route path="/forge/matrix" element={<ForgeMatrixPage />} />
+          <Route path="/forge/saved-prompts" element={<ForgeSavedPromptsPage />} />
           <Route path="/forge/arena" element={<ForgeArenaPage />} />
           <Route path="/forge/arena/:id" element={<ForgeArenaPage />} />
           <Route path="/forge/:id/progress" element={<ForgeProgressPage />} />

@@ -30,6 +30,7 @@ const ForgeDataset = require('./ForgeDataset')(sequelize, DataTypes);
 const ForgeArena = require('./ForgeArena')(sequelize, DataTypes);
 const ForgeSim = require('./ForgeSim')(sequelize, DataTypes);
 const ForgeLlm = require('./ForgeLlm')(sequelize, DataTypes);
+const ForgeSavedPrompt = require('./ForgeSavedPrompt')(sequelize, DataTypes);
 
 // --- associations ---
 
@@ -64,4 +65,5 @@ module.exports = {
   ForgeArena,
   ForgeSim,
   ForgeLlm,
+  ForgeSavedPrompt,
 };

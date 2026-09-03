@@ -12,6 +12,7 @@ module.exports = (sequelize, DataTypes) =>
       winner_run_id: { type: DataTypes.TEXT, allowNull: true },
       ranking_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
       created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
+      updated_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
       completed_at: { type: DataTypes.DATE, allowNull: true },
     },
     { tableName: 'forge_arenas', timestamps: false }

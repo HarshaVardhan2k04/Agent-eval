@@ -39,8 +39,10 @@ from src.forge import verify as fverify
 from src.forge.coach import Coach, apply_standalone_edits, apply_layer_edits
 from src.forge.scorer import score_probe
 
-# deepeval-metric-verdicted problems: the metric score IS the detector.
-METRIC_PROBLEMS = {"p40": "faithfulness", "p41": "self_consistency", "p42": "answer_relevancy"}
+# deepeval-metric-verdicted problems: the metric score IS the detector. The mapping
+# lives in detectors.py beside every other detector registry — this module must not
+# name a problem id (see tests/test_no_problem_ids.py).
+METRIC_PROBLEMS = fdet.METRIC_DETECTORS
 
 
 class EventBus:
@@ -389,7 +391,12 @@ class ForgeRunner:
             raise RuntimeError(f"endpoint failing: {n_errors}/{len(sims)} conversations errored — {first_err[:180]}")
         return sims
 
-    async def _grade_sims(self, system_prompt, sims, problem_ids, votes, kind):
+    async def _grade_matrix_sims(self, system_prompt, sims, problem_ids, votes, kind):
+        """Grade per-problem scenario conversations (the tiered coaching path).
+
+        Distinct from _grade_sims below, which sweeps EVERY problem across a finished
+        dataset. Do not merge the names: both are live and they take different arguments
+        (see tests/test_no_duplicate_methods.py)."""
         judge = self.judge_llm
         out = {}
         graded = 0
@@ -442,7 +449,7 @@ class ForgeRunner:
     async def _run_matrix(self, system_prompt, greeting, problem_ids, votes, kind="detector"):
         """Run-then-grade over the problem set: generate all conversations, then grade."""
         sims = await self._generate_sims(system_prompt, greeting, problem_ids, votes, kind)
-        return await self._grade_sims(system_prompt, sims, problem_ids, votes, kind)
+        return await self._grade_matrix_sims(system_prompt, sims, problem_ids, votes, kind)
 
     async def _deep_confirm(self, system_prompt, greeting, statuses, pids, confirm_votes):
         """A problem may only be declared SOLVED after ~confirm_votes simulations pass at
@@ -815,7 +822,12 @@ class ForgeRunner:
             behaviour = (problem_defs.get(pid) or {}).get("behaviour") or pid
             fails = []
             for sim, convo in convos:
-                if pid in fdet.MECHANICAL_CHECKERS:
+                # detectors.py owns the pid -> checker mapping; the runner only asks
+                # which KIND of checker is registered, so renumbering never breaks it.
+                if pid in fdet.SIM_CHECKERS:
+                    ok, reason, fturn = fdet.SIM_CHECKERS[pid](sim, convo)
+                    occurred = not ok
+                elif pid in fdet.MECHANICAL_CHECKERS:
                     ok, reason, fturn = fdet.MECHANICAL_CHECKERS[pid](convo, None)
                     occurred = not ok
                 else:
@@ -1178,6 +1190,9 @@ class ForgeRunner:
                     "evidence": " | ".join(str(statuses.get(t, {}).get("evidence", ""))[:90] for t in targets),
                     "layer_for_fix": pdef.get("layer_for_fix"),
                     "lever": (" || ".join(filter(None, (problem_defs[t].get("winning_lever") for t in targets))))[:1400],
+                    # worked examples for every clustered problem; the coach budgets them
+                    "references": [r for t in targets
+                                   for r in (problem_defs[t].get("references") or [])],
                 }
                 decision = await self.coach.propose(
                     mode=mode,
