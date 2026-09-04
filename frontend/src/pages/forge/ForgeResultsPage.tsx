@@ -2,9 +2,10 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { T, card, label, backBtn } from '../../theme'
 import { useForgeStore } from '../../stores/forgeStore'
+import type { UnsolvedReason } from '../../stores/forgeStore'
 import { api } from '../../api/client'
 import { ScoreRing, MetricBar, SECTION_LABELS, METRIC_LABELS } from '../../components/analysis'
-import { RunStatusChip, SolvedGauge, VerdictCell, LayerBadge, ProofPanel,
+import { RunDuration, RunStatusChip, SolvedGauge, VerdictCell, LayerBadge, ProofPanel,
   ComboScorecard } from '../../components/forge'
 
 type StatusEntry = { verdict: string | null; passes?: number; votes?: number; evidence?: string; source?: string; sim_uids?: string[]; fails?: { sim_uid: string | null; reason?: string; failing_turn?: number | null }[] }
@@ -64,6 +65,7 @@ export function ForgeResultsPage() {
           <h1 style={{ fontSize: 25, fontWeight: 650, margin: 0, color: T.text }}>{run.name || run.id}</h1>
           <p style={{ fontSize: 13, color: T.muted, margin: '5px 0 0' }}>
             {run.mode} · {run.dataset_kind} dataset · {run.arena_id ? 'arena run — single pass' : `v${run.current_version}`}
+            {run.completed_at && <> · <RunDuration createdAt={run.created_at} completedAt={run.completed_at} label="took" /></>}
           </p>
         </div>
         <RunStatusChip status={run.status} />
@@ -269,6 +271,10 @@ export function ForgeResultsPage() {
         </>
       )}
 
+      {/* WHY THE GAP — a run that stops below the gate accounts for it problem by problem */}
+      <UnsolvedPanel unsolved={run.unsolved_json} behaviourOf={(pid) =>
+        problems.find((p) => p.id === pid)?.behaviour || pid} />
+
       {/* THE REPORT CARD — every judged problem, one dense row, click = proof */}
       <div style={{ ...label, margin: '26px 0 10px' }}>
         Report card — every problem, its votes, and the evidence (click a row for the conversations)
@@ -326,5 +332,73 @@ function HeaderLink({ children, onClick }: { children: React.ReactNode; onClick:
       style={{ padding: '9px 14px', borderRadius: 10, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 13, cursor: 'pointer' }}>
       {children}
     </button>
+  )
+}
+
+
+// ── WHY EACH PROBLEM IS NOT SOLVED ──────────────────────────────────────────
+// The point of a run is a prompt with the matrix solved. When it stops short, the
+// gap has to be accountable per problem — and each category maps to a DIFFERENT
+// action, which is why they are grouped rather than listed flat.
+const CAT_META: Record<string, { label: string; hint: string; color: string }> = {
+  regression: { label: 'Fixing it broke something else', hint: 'Genuinely in tension with another problem. The coach now retries these as a pair; a human may need to settle the trade-off.', color: T.amber },
+  refuted: { label: 'The fix did not survive verification', hint: 'The edit passed the screen but the adversarial verifier refuted it — masked, not fixed.', color: T.amber },
+  retry_budget: { label: 'Out of attempts', hint: 'Retired after its attempt budget so the run could reach other problems. Raise max_attempts_per_problem to push harder.', color: T.amber2 },
+  iteration_budget: { label: 'Never attempted — out of iterations', hint: 'The run hit max_iterations first. This is a compute knob, not a hard limit: raise it and these get worked.', color: T.blue },
+  needs_you: { label: 'Waiting on your decision', hint: 'The coach escalated rather than guess — usually a shared-layer edit.', color: T.purple },
+  not_exercised: { label: 'Your dataset never tested it', hint: 'No conversation created the situation, so nothing can be concluded. Fix the DATASET, not the prompt — add a persona that provokes this.', color: T.blue },
+  unknown: { label: 'No usable verdict', hint: 'The judge could not be read on these conversations.', color: T.fainter },
+  no_detector: { label: 'No scripted detector', hint: 'Verdict comes only from at-scale stress signals; the coach cannot iterate on it directly.', color: T.fainter },
+  in_progress: { label: 'Still failing', hint: 'Attempted but not yet solved when the run ended.', color: T.amber2 },
+}
+const CAT_ORDER = ['regression', 'refuted', 'in_progress', 'retry_budget', 'iteration_budget',
+  'needs_you', 'not_exercised', 'unknown', 'no_detector']
+
+function UnsolvedPanel({ unsolved, behaviourOf }: {
+  unsolved: Record<string, UnsolvedReason> | null | undefined
+  behaviourOf: (pid: string) => string
+}) {
+  const rows = Object.entries(unsolved || {})
+  if (rows.length === 0) return null
+  const byCat = new Map<string, [string, UnsolvedReason][]>()
+  for (const r of rows) byCat.set(r[1].category, [...(byCat.get(r[1].category) || []), r])
+  const cats = CAT_ORDER.filter((c) => byCat.has(c))
+    .concat([...byCat.keys()].filter((c) => !CAT_ORDER.includes(c)))
+
+  return (
+    <>
+      <div style={{ ...label, margin: '26px 0 10px' }}>
+        Why {rows.length} problem{rows.length > 1 ? 's are' : ' is'} not solved — grouped by what would fix it
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {cats.map((cat) => {
+          const m = CAT_META[cat] || { label: cat, hint: '', color: T.fainter }
+          const items = (byCat.get(cat) || []).sort((a, b) => Number(a[0].slice(1)) - Number(b[0].slice(1)))
+          return (
+            <div key={cat} style={{ ...card, padding: 0, overflow: 'hidden', display: 'flex' }}>
+              <div style={{ width: 4, background: m.color, flexShrink: 0 }} />
+              <div style={{ padding: '13px 16px', flex: 1, minWidth: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 9, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 14, fontWeight: 650, color: T.text }}>{m.label}</span>
+                  <span style={{ fontSize: 12, color: m.color, fontWeight: 600 }}>{items.length}</span>
+                </div>
+                <div style={{ fontSize: 12.5, color: T.muted, marginTop: 4, lineHeight: 1.5 }}>{m.hint}</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 10 }}>
+                  {items.map(([pid, r]) => (
+                    <div key={pid} style={{ display: 'flex', gap: 9, alignItems: 'baseline', fontSize: 12.5 }}>
+                      <span style={{ fontFamily: T.mono, color: T.text3, width: 34, flexShrink: 0 }}>{pid}</span>
+                      <span style={{ color: T.text2, flexShrink: 0, maxWidth: '38%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {behaviourOf(pid)}
+                      </span>
+                      <span style={{ color: T.faint, minWidth: 0 }}>{r.why}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </>
   )
 }

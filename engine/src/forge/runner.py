@@ -25,6 +25,7 @@ import asyncio
 
 import httpx
 
+from src.config import DEFAULT_MAX_LLM_CONCURRENCY
 from src.llm.client import LLMClient
 from src.core.conversation import ConversationEngine
 from src.tools.simulator import ToolSimulator
@@ -34,6 +35,7 @@ from src.analysis.evaluator import CallEvaluator
 from src.forge import merge as fmerge
 from src.forge import combos as fcombo
 from src.forge import detectors as fdet
+from src.forge import coach as fcoach
 from src.forge import stress as fstress
 from src.forge import verify as fverify
 from src.forge.coach import Coach, apply_standalone_edits, apply_layer_edits
@@ -404,15 +406,22 @@ class ForgeRunner:
         by_pid = {}
         for sim in sims:
             by_pid.setdefault(sim["pid"], []).append(sim)
-        for pid, group in by_pid.items():
-            if self._stopped:
-                break
-            results, uids, fails = [], [], []
-            for sim in sorted(group, key=lambda x: x["idx"]):
+        # Judge CONCURRENTLY. Generation has always run 8 at a time; grading ran one at a
+        # time, so a 93-conversation matrix was 93 serial judge calls — 42 of the first
+        # 50 minutes of a real run. gather() keeps the results in sim order, so the
+        # evidence quoted for a problem stays deterministic.
+        sem = asyncio.Semaphore(DEFAULT_MAX_LLM_CONCURRENCY)
+
+        async def _judge_one(pid, sim):
+            nonlocal graded
+            async with sem:
+                if self._stopped:
+                    return sim, False, "stopped", None
                 # an errored/empty conversation is UNGRADEABLE — always a fail with the
                 # real reason, never a judged pass on a blank transcript.
                 if (any("[generation error" in (c or "") for _r, c in sim["convo"])
-                        or not any(r == "A" and (c or "").strip() for r, c in sim["convo"][1:]))                         and sim["ended"] is None:
+                        or not any(r == "A" and (c or "").strip() for r, c in sim["convo"][1:])) \
+                        and sim["ended"] is None:
                     ok, reason, fturn = False, "generation error — no agent reply", None
                 else:
                     try:
@@ -420,10 +429,6 @@ class ForgeRunner:
                                                                  system_prompt=system_prompt)
                     except Exception as e:
                         ok, reason, fturn = False, f"grade_err {str(e)[:40]}", None
-                results.append(bool(ok))
-                uids.append(sim["sim_uid"])
-                if not ok:
-                    fails.append({"sim_uid": sim["sim_uid"], "reason": reason, "failing_turn": fturn})
                 graded += 1
                 await self.bus.emit("sims_graded", {"run_id": self.run_id, "sims": [{
                     "sim_uid": sim["sim_uid"], "verdict": "pass" if ok else "fail",
@@ -431,6 +436,18 @@ class ForgeRunner:
                 await self.bus.emit("progress", {"run_id": self.run_id, "phase": "judging",
                                                  "done": graded, "total": total, "problem_id": pid,
                                                  "verdict": "pass" if ok else "fail"})
+                return sim, bool(ok), reason, fturn
+
+        for pid, group in by_pid.items():
+            if self._stopped:
+                break
+            results, uids, fails = [], [], []
+            ordered = sorted(group, key=lambda x: x["idx"])
+            for sim, ok, reason, fturn in await asyncio.gather(*(_judge_one(pid, s) for s in ordered)):
+                results.append(bool(ok))
+                uids.append(sim["sim_uid"])
+                if not ok:
+                    fails.append({"sim_uid": sim["sim_uid"], "reason": reason, "failing_turn": fturn})
             passes = sum(results)
             n = len(results)
             ev = (fails[0]["reason"] if fails else "ok")
@@ -471,7 +488,6 @@ class ForgeRunner:
         """SINGLE-PASS metrics: evaluate the SAME stored scenario conversations —
         no extra probe conversations are generated. Returns (composite, sections,
         metrics, latency) aggregated by median across the sims."""
-        import statistics as _st
 
         def _rows(sim):
             # sims carry either scripted convo tuples (+meta) or raw transcript rows
@@ -542,7 +558,11 @@ class ForgeRunner:
         comps = [r["composite_score"] for r in results if r.get("composite_score") is not None]
         composite = round(sum(comps) / len(comps), 1) if comps else None
 
-        def _med(key):
+        # MEAN, not median: `composite` above is the mean of the per-conversation
+        # composites, so a median breakdown cannot add up to the headline it explains.
+        # Median also hides a split result — 7 conversations at 20 and 8 at 80 reads as
+        # 80, when what a caller actually gets is 52.
+        def _agg_mean(key):
             keys = set()
             for r in results:
                 keys.update((r.get(key) or {}).keys())
@@ -553,7 +573,7 @@ class ForgeRunner:
                 else:
                     vals = [(r.get(key) or {}).get(k2) for r in results]
                 vals = [v for v in vals if isinstance(v, (int, float))]
-                out[k2] = round(_st.median(vals), 1) if vals else None
+                out[k2] = round(sum(vals) / len(vals), 1) if vals else None
             # tool_calling is CODE-COMPUTED, so a 0 is a real failed call, not judge
             # noise — median would discard exactly the signal that matters. Pool it:
             # total valid calls / total attempts across the run, weighting each
@@ -599,7 +619,7 @@ class ForgeRunner:
                        "ttft_p50_ms": (lambda v: round(v[min(len(v)-1, int(0.5*(len(v)-1)))], 1))(sorted(ttft_all)) if ttft_all else None,
                        "tokens_avg": round(sum(tok_all) / len(tok_all), 1) if tok_all else None,
                        "long_turn_pct": round(100.0 * long_turns / n_text, 1) if n_text else None}
-        return composite, _med("sections"), _med("metrics"), latency
+        return composite, _agg_mean("sections"), _agg_mean("metrics"), latency
 
     async def _deepeval_sample(self, prompt_bundle, probes, direction, best_of_n):
         # Category-DIVERSE sample: one probe per distinct category (positive, objection,
@@ -644,10 +664,9 @@ class ForgeRunner:
         comps = [r["composite"] for r in results if r["composite"] is not None]
         composite = round(sum(comps) / len(comps), 1) if comps else None
 
-        # Aggregate per-section / per-metric medians across the sampled probes so the
-        # results page can render the full quality breakdown, not just the composite.
-        import statistics as _st
-
+        # Aggregate per-section / per-metric MEANS across the sampled probes so the
+        # results page can render the full quality breakdown, and so that breakdown is
+        # computed the same way as the composite it explains (see _agg_mean above).
         def _agg(key):
             keys = set()
             for r in results:
@@ -655,7 +674,7 @@ class ForgeRunner:
             out = {}
             for k in keys:
                 vals = [r[key][k] for r in results if (r.get(key) or {}).get(k) is not None]
-                out[k] = round(_st.median(vals), 1) if vals else None
+                out[k] = round(sum(vals) / len(vals), 1) if vals else None
             # see _pooled_tool_calling: median hides real tool failures
             if key == "metrics":
                 pooled = _pooled_from_probe_results(results)
@@ -816,35 +835,79 @@ class ForgeRunner:
         statuses = {}
         total_checks = len(sweep_pids) * len(convos)
         done_checks = 0
+        # Same reason as _grade_matrix_sims: one judge call at a time turns a dataset
+        # sweep into (problems x conversations) serial LLM round-trips.
+        sweep_sem = asyncio.Semaphore(DEFAULT_MAX_LLM_CONCURRENCY)
+
+        async def _sweep_one(pid, behaviour, sim, convo):
+            """-> (occurred, reason, failing_turn, unjudged, unexercised)"""
+            nonlocal done_checks
+            # detectors.py owns the pid -> checker mapping; the runner only asks
+            # which KIND of checker is registered, so renumbering never breaks it.
+            if pid in fdet.SIM_CHECKERS:
+                ok, reason, fturn = fdet.SIM_CHECKERS[pid](sim, convo)
+                occurred, unj, unex = not ok, 0, 0
+            elif pid in fdet.MECHANICAL_CHECKERS:
+                ok, reason, fturn = fdet.MECHANICAL_CHECKERS[pid](convo, None)
+                occurred, unj, unex = not ok, 0, 0
+            else:
+                async with sweep_sem:
+                    try:
+                        occurred, arose, reason, fturn = await fdet.observe_problem(
+                            self.judge_llm, behaviour, convo)
+                        # The dataset never created the situation. Absence of evidence is
+                        # not evidence of absence — this conversation proves nothing about
+                        # the problem and must not be banked as a clean pass.
+                        unj, unex = 0, (0 if arose else 1)
+                    except fdet.JudgeError as e:
+                        # NOT clean and NOT failed: this conversation was not judged.
+                        occurred, reason, fturn = False, f"unjudged: {e}", None
+                        unj, unex = 1, 0
+            done_checks += 1
+            await self.bus.emit("progress", {"run_id": self.run_id, "phase": "judging",
+                                             "done": done_checks, "total": total_checks,
+                                             "problem_id": pid, "combo": combo_key})
+            return occurred, reason, fturn, unj, unex
+
         for pid in sweep_pids:
             if self._stopped:
                 break
             behaviour = (problem_defs.get(pid) or {}).get("behaviour") or pid
             fails = []
-            for sim, convo in convos:
-                # detectors.py owns the pid -> checker mapping; the runner only asks
-                # which KIND of checker is registered, so renumbering never breaks it.
-                if pid in fdet.SIM_CHECKERS:
-                    ok, reason, fturn = fdet.SIM_CHECKERS[pid](sim, convo)
-                    occurred = not ok
-                elif pid in fdet.MECHANICAL_CHECKERS:
-                    ok, reason, fturn = fdet.MECHANICAL_CHECKERS[pid](convo, None)
-                    occurred = not ok
-                else:
-                    occurred, reason, fturn = await fdet.observe_problem(self.judge_llm, behaviour, convo)
+            unjudged = 0          # judge unreadable — proof of nothing, counted as neither
+            unexercised = 0       # the situation never arose — also proof of nothing
+            swept = await asyncio.gather(
+                *(_sweep_one(pid, behaviour, sim, convo) for sim, convo in convos))
+            for (sim, _convo), (occurred, reason, fturn, unj, unex) in zip(convos, swept):
+                unjudged += unj
+                unexercised += unex
                 if occurred:
                     fails.append({"sim_uid": sim["sim_uid"], "reason": reason, "failing_turn": fturn})
-                done_checks += 1
-                await self.bus.emit("progress", {"run_id": self.run_id, "phase": "judging",
-                                                 "done": done_checks, "total": total_checks,
-                                                 "problem_id": pid, "combo": combo_key})
-            n = len(convos)
-            clean = n - len(fails)
+            # Only conversations that were judged AND actually exercised the behaviour
+            # can support a "solved" verdict.
+            n = len(convos) - unjudged - unexercised
+            clean = max(0, n - len(fails))
+            # An occurrence is proof, whatever else happened. Without one, "solved" needs
+            # at least one conversation that really tested the behaviour; otherwise the
+            # honest verdict is unknown, not a pass.
+            verdict = "N" if fails else ("~" if n <= 0 else "Y")
+            skipped = ", ".join(p for p in (
+                f"{unjudged} unjudged" if unjudged else "",
+                f"{unexercised} never exercised" if unexercised else "") if p)
+            tail = f" ({skipped})" if skipped else ""
+            why = ""
+            if verdict == "~":
+                why = ("never exercised — no conversation created this situation"
+                       if unexercised and not unjudged
+                       else f"judge unreadable on all {unjudged} conversations"
+                       if unjudged and not unexercised
+                       else f"no usable verdict — {skipped}")
             statuses[pid] = {
-                "verdict": "Y" if not fails else "N",
+                "verdict": verdict,
                 "passes": clean, "votes": n,
-                "evidence": (f"{clean}/{n} not observed in any conversation" if not fails
-                             else f"{clean}/{n} — occurred in {len(fails)}: {fails[0]['reason']}"),
+                "evidence": (why if verdict == "~"
+                             else f"{clean}/{n} not observed in any conversation{tail}" if not fails
+                             else f"{clean}/{n} — occurred in {len(fails)}: {fails[0]['reason']}{tail}"),
                 "sim_uids": [f["sim_uid"] for f in fails] or [sim["sim_uid"] for sim, _c in convos[:3]],
                 "fails": fails[:5],
             }
@@ -1140,8 +1203,17 @@ class ForgeRunner:
         self._cur_version = 0
         consecutive_reverts = 0
         parked = set()
+        park_reason = {}          # pid -> WHY it is not solved, for the report
+        attempts_by_pid = {}      # pid -> how many candidate edits it has cost
+        pending_regressions = {}  # pid -> problems its last fix broke, to reconcile on retry
+        # A problem gets a bounded number of tries and is then retired WITH A REASON.
+        # Before this, the worst-open problem was re-picked every iteration, so a run
+        # could spend its entire budget failing the same fix (test 234: p1 three times,
+        # breaking p20 every time) while 25 other problems were never attempted once.
+        max_attempts_pp = int(scoring.get("max_attempts_per_problem", 2))
         revert_history = []
         accepts = 0
+        last_targets = None
         final_status = "converged_below_gate"
 
         if self._solved_pct(statuses, denominator) >= gate_pct:
@@ -1173,8 +1245,20 @@ class ForgeRunner:
                     if clusters:
                         targets = clusters[0]["problem_ids"][:3]
                 target = targets[0]
+                # Its last attempt fixed `target` but broke these. Hand the coach BOTH so
+                # it has to satisfy them together — retrying the target alone just walks
+                # into the same regression (p1 "stop capitulating" vs p20 "end on a hard
+                # no" are in genuine tension and must be solved as one edit).
+                for reg in pending_regressions.get(target, []):
+                    if reg not in targets and reg in problem_defs:
+                        targets.append(reg)
                 pdef = problem_defs[target]
                 cluster_label = "+".join(targets)
+                # patience guards against thrashing on ONE thing; moving to a new target
+                # is progress, so the counter restarts with it
+                if last_targets != tuple(targets):
+                    consecutive_reverts = 0
+                last_targets = tuple(targets)
                 await self.bus.emit("iteration_start", {"run_id": self.run_id, "attempt": attempt,
                                                         "targeted_problem": cluster_label})
 
@@ -1236,6 +1320,35 @@ class ForgeRunner:
                         })
                         continue
 
+                # GENERALISATION GUARD: an edit that quotes the probe's own words is a
+                # detector fix, not a behaviour fix — it turns the row green and leaves
+                # the bug for every caller who phrases it differently. Bounce it back
+                # with the reason so the next attempt states the principle instead.
+                leak = None
+                for t in targets:
+                    sc = fdet.scenario_for(t)
+                    if sc and (leak := fcoach.probe_leak(decision.get("edits"), sc[0])):
+                        break
+                if leak:
+                    consecutive_reverts += 1
+                    revert_history.append({
+                        "attempt": attempt, "changes": decision.get("changes_summary", ""),
+                        "reason": "keyed to the test wording",
+                        "detail": (f'the edit quoted the probe verbatim ("{leak}"). Write the RULE '
+                                   "that covers every phrasing of this situation, never the words "
+                                   "the test happens to use."),
+                        "regressed": []})
+                    for t in targets:
+                        attempts_by_pid[t] = attempts_by_pid.get(t, 0) + 1
+                        if attempts_by_pid[t] >= max_attempts_pp:
+                            parked.add(t)
+                            park_reason[t] = (f"{attempts_by_pid[t]} attempts, all keyed to the test "
+                                              "wording rather than the underlying rule")
+                    await self.bus.emit("iteration_note", {
+                        "run_id": self.run_id, "attempt": attempt,
+                        "note": f"rejected — edit quoted the probe verbatim (\"{leak}\")"})
+                    continue
+
                 cand, applied = self._apply_fix(mode, champion, decision)
                 if applied == 0:
                     parked.update(targets)  # coach couldn't produce an applicable edit; park the cluster
@@ -1288,6 +1401,17 @@ class ForgeRunner:
                     reason = "regression" if regressed else ("verify_failed" if verify_res else "no_improvement")
                     revert_history.append({"attempt": attempt, "changes": decision.get("changes_summary", ""),
                                            "reason": reason, "regressed": regressed})
+                    if regressed:
+                        pending_regressions[target] = regressed
+                    for t in targets:
+                        attempts_by_pid[t] = attempts_by_pid.get(t, 0) + 1
+                        if attempts_by_pid[t] >= max_attempts_pp:
+                            parked.add(t)
+                            park_reason[t] = (
+                                f"{attempts_by_pid[t]} fix attempts, all reverted — last one "
+                                + (f"broke {', '.join(regressed)}" if regressed
+                                   else "was refuted by the adversarial verifier" if verify_res
+                                   else "did not move the problem"))
                     await self.bus.emit("version_recorded", {
                         "run_id": self.run_id, "version": version, "status": "reverted", "tier": "candidate",
                         "targeted_problem": cluster_label, "layer_for_fix": decision.get("layer_for_fix"),
@@ -1304,6 +1428,8 @@ class ForgeRunner:
                 champion = cand
                 consecutive_reverts = 0
                 revert_history = []
+                for t in targets:
+                    pending_regressions.pop(t, None)
                 accepts += 1
                 new_statuses = await self._run_matrix(csp, cgreet, denominator, votes)
                 # carry forward stress-only verdicts the matrix can't re-test
@@ -1343,14 +1469,58 @@ class ForgeRunner:
                     break
 
         solved_pct = self._solved_pct(statuses, denominator)
+        unsolved = self._unsolved_reasons(statuses, denominator, targetable, parked, park_reason,
+                                          attempts_by_pid, max_iterations)
         if final_status == "converged_below_gate" and parked:
             final_status = "awaiting_human"
         await self.bus.emit("run_complete", {
             "run_id": self.run_id, "status": final_status, "solved_pct": solved_pct,
             "final_version": version, "parked": list(parked),
+            # Every problem that is not solved says WHY. A run that stops short must
+            # account for the gap problem by problem, not just report a percentage.
+            "unsolved": unsolved,
             "champion": (champion.get("layers") if mode == "layered" else {"blob": champion.get("blob")}),
         })
-        return {"status": final_status, "solved_pct": solved_pct, "version": version}
+        return {"status": final_status, "solved_pct": solved_pct, "version": version,
+                "unsolved": unsolved}
+
+    @staticmethod
+    def _unsolved_reasons(statuses, denominator, targetable, parked, park_reason,
+                          attempts_by_pid, max_iterations):
+        """One plain-language reason per unsolved problem, in priority order.
+
+        The categories are what a human needs in order to act: `retry_budget` and
+        `iteration_budget` mean spend more compute; `regression` and `refuted` mean the
+        fix is genuinely hard; `not_exercised` means the DATASET is at fault, not the
+        prompt; `no_detector` means we never had a way to test it here."""
+        out = {}
+        for pid in denominator:
+            st = statuses.get(pid) or {}
+            verdict = st.get("verdict")
+            if verdict == "Y":
+                continue
+            ev = str(st.get("evidence") or "")
+            if pid in park_reason:
+                cat = ("regression" if "broke" in park_reason[pid]
+                       else "refuted" if "refuted" in park_reason[pid] else "retry_budget")
+                why = park_reason[pid]
+            elif pid in parked:
+                cat, why = "needs_you", "escalated to you — the coach would not decide this alone"
+            elif verdict == "~" and "never exercised" in ev:
+                cat, why = "not_exercised", ev
+            elif verdict == "~":
+                cat, why = "unknown", ev or "no usable verdict"
+            elif pid not in targetable:
+                cat, why = "no_detector", (ev or "no scripted detector — verdict comes from at-scale signals only")
+            elif not attempts_by_pid.get(pid):
+                cat, why = "iteration_budget", (
+                    f"never attempted — the run used its {max_iterations}-iteration budget on "
+                    "higher-priority problems. Raise max_iterations to reach this one.")
+            else:
+                cat, why = "in_progress", f"{attempts_by_pid[pid]} attempt(s) so far, still failing"
+            out[pid] = {"verdict": verdict, "category": cat, "why": why,
+                        "attempts": attempts_by_pid.get(pid, 0), "evidence": ev[:160]}
+        return out
 
     def _fold_metrics(self, statuses, metrics, denominator):
         """Fold deepeval metric scores into problem verdicts (runs at the deepeval tier:

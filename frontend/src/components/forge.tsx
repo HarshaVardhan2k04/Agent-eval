@@ -781,7 +781,7 @@ function deriveNow(events: ForgeEventLike[]): NowState {
     target: null, layer: null, attempt: null, combo: null, since: null, seen: new Set() }
   const enter = (k: string, at: string) => {
     if (n.key !== k || n.since == null) {
-      n.since = new Date(at).getTime(); n.done = null; n.total = null; n.detail = ''
+      n.since = new Date(at).getTime(); n.done = null; n.total = null; n.detail = ''; n.note = ''
     }
     n.key = k
     n.seen.add(k)
@@ -816,8 +816,8 @@ function deriveNow(events: ForgeEventLike[]): NowState {
         break
       case 'iteration_note': {
         const note = str(d.note)
-        n.note = note
         if (/^coaching \S+:/.test(note)) enter('tool_fix', e.created_at)
+        n.note = note
         const m = note.match(/^combo (\d+\/\d+) — (\S+?):/)
         if (m) n.combo = `${m[2]} (${m[1]})`
         break
@@ -948,5 +948,45 @@ function Pill({ text, mono }: { text: string; mono?: boolean }) {
       fontSize: 11.5, fontFamily: mono ? T.mono : undefined,
       maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
     }}>{text}</span>
+  )
+}
+
+// ── RUN DURATION ────────────────────────────────────────────────────────────
+// Wall-clock from starting the run to the moment it handed back to a human. That
+// handover is the end of the machine's job, so it is what `completed_at` marks —
+// including a run halted at the combo gate, which stops and waits for a person.
+export function runDuration(createdAt: string, completedAt: string | null, nowMs?: number) {
+  const start = new Date(createdAt).getTime()
+  if (!Number.isFinite(start)) return null
+  const end = completedAt ? new Date(completedAt).getTime() : (nowMs ?? 0)
+  if (!end || end < start) return null
+  return end - start
+}
+
+export function fmtDuration(ms: number | null) {
+  if (ms == null) return null
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, '0')}s`
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`
+}
+
+/** Elapsed for a live run, final duration for a finished one. */
+export function RunDuration({ createdAt, completedAt, live, label = 'took' }: {
+  createdAt: string; completedAt: string | null; live?: boolean; label?: string
+}) {
+  const [now, setNow] = useState(0)
+  useEffect(() => {
+    if (!live) return
+    const iv = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(iv)
+  }, [live])
+  const txt = fmtDuration(runDuration(createdAt, completedAt, now))
+  if (!txt) return null
+  return (
+    <span style={{ fontSize: 12.5, color: T.faint, whiteSpace: 'nowrap' }}>
+      {live ? 'running' : label} {txt}
+    </span>
   )
 }

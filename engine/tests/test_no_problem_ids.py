@@ -8,19 +8,30 @@ failing loudly. This guards that boundary.
 import pathlib
 import re
 
-RUNNER = pathlib.Path(__file__).resolve().parents[1] / "src" / "forge" / "runner.py"
+FORGE = pathlib.Path(__file__).resolve().parents[1] / "src" / "forge"
+
+# Modules that ORCHESTRATE. They ask detectors.py what is registered for an id; they
+# must never carry their own copy of the catalogue. verify.py did — a private
+# {"p20".."p24"} set duplicating the tools_on flag scenario_for already returns.
+ORCHESTRATORS = ["runner.py", "verify.py", "toolchecks.py"]
+
+# Exempt, deliberately: detectors.py and stress.py ARE the registries (that is the whole
+# point — one place that maps id -> checker), and coach.py names ids only inside a JSON
+# shape example in a prompt string.
+
 _ID = re.compile(r"""['"]p\d+['"]""")
 
 
-def test_runner_names_no_problem_id():
-    hits = [(n, line.strip())
-            for n, line in enumerate(RUNNER.read_text().splitlines(), 1)
+def test_orchestrators_name_no_problem_id():
+    hits = [(mod, n, line.strip())
+            for mod in ORCHESTRATORS
+            for n, line in enumerate((FORGE / mod).read_text().splitlines(), 1)
             if _ID.search(line)]
     assert not hits, (
-        "runner.py hardcodes problem ids — register them in detectors.py instead:\n"
-        + "\n".join(f"  line {n}: {t}" for n, t in hits))
+        "these modules hardcode problem ids — register them in detectors.py instead:\n"
+        + "\n".join(f"  {m}:{n}: {t}" for m, n, t in hits))
 
 
 if __name__ == "__main__":
-    test_runner_names_no_problem_id()
-    print("PASS — runner.py names no problem id")
+    test_orchestrators_name_no_problem_id()
+    print(f"PASS — {', '.join(ORCHESTRATORS)} name no problem id")

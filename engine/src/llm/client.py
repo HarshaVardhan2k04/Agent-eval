@@ -207,8 +207,22 @@ class LLMClient:
         content = (raw.content or "").strip()
         content = content.replace("```json", "").replace("```", "").strip()
         match = re.search(r"\{.*\}", content, re.DOTALL)
+        if not match and enable_thinking:
+            # Ran out of budget mid-object: thinking ate the tokens the answer needed.
+            # Retry once with thinking OFF so the whole budget goes to the JSON. Silent
+            # truncation used to surface as a parse error that callers scored as a
+            # behavioural verdict — see the polarity note in forge/detectors.py.
+            raw = await self.chat(
+                messages, temperature=temperature, max_tokens=max_tokens,
+                enable_thinking=False, seed=seed, json_mode=json_mode,
+            )
+            content = (raw.content or "").strip().replace("```json", "").replace("```", "").strip()
+            match = re.search(r"\{.*\}", content, re.DOTALL)
         if not match:
-            raise ValueError(f"Failed to parse JSON from LLM response: {content[:200]}")
+            fr = getattr(raw, "finish_reason", None)
+            raise ValueError(
+                f"Failed to parse JSON from LLM response (finish_reason={fr}, "
+                f"max_tokens={max_tokens}): {content[:200]}")
         blob = match.group(0)
         try:
             return json.loads(blob)

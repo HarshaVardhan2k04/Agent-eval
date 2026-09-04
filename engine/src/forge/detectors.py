@@ -17,9 +17,11 @@ blob for standalone), already wrapped with the LEAD-INFORMATION preamble.
 """
 from __future__ import annotations
 
+import json
 import re
 
-from src.config import DEFAULT_AGENT_TEMPERATURE, DEFAULT_JUDGE_TEMPERATURE
+from src.config import (DEFAULT_AGENT_TEMPERATURE, DEFAULT_JUDGE_TEMPERATURE,
+                        DEFAULT_JUDGE_MAX_TOKENS, DEFAULT_MAX_TOKENS)
 
 from src.tools.definitions import TOOL_DEFINITIONS
 from src.tools import parser as tparse
@@ -56,7 +58,7 @@ async def _agent_turn(llm, system_prompt, convo, tools_on, tool_sim=None):
     tools = None
     if tools_on:
         tools = (tool_sim.get_schemas() if tool_sim else None) or END_CALL_TOOL
-    msg = await llm.chat(msgs, tools=tools, temperature=DEFAULT_AGENT_TEMPERATURE, max_tokens=100)
+    msg = await llm.chat(msgs, tools=tools, temperature=DEFAULT_AGENT_TEMPERATURE, max_tokens=DEFAULT_MAX_TOKENS)
     calls = []
     rounds = 0
     while tools_on and (msg.tool_calls or []) and rounds < 3:
@@ -86,7 +88,7 @@ async def _agent_turn(llm, system_prompt, convo, tools_on, tool_sim=None):
                 msgs.append({"role": "tool", "tool_call_id": tc.id, "content": str(result or "")})
         if terminal is not None:
             return ("END", terminal, msg, calls)          # production deletes the room here
-        msg = await llm.chat(msgs, tools=tools, temperature=DEFAULT_AGENT_TEMPERATURE, max_tokens=100)
+        msg = await llm.chat(msgs, tools=tools, temperature=DEFAULT_AGENT_TEMPERATURE, max_tokens=DEFAULT_MAX_TOKENS)
     return ("SAY", (msg.content or "").strip(), msg, calls)
 
 
@@ -397,7 +399,7 @@ async def _prompt_judge(judge_llm, sp, rubric):
     try:
         data = await judge_llm.chat_json(
             [{"role": "system", "content": _PROMPT_JUDGE_SYS}, {"role": "user", "content": prompt}],
-            temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=400, enable_thinking=True,
+            temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=DEFAULT_JUDGE_MAX_TOKENS, enable_thinking=True,
         )
         return bool(data.get("pass")), str(data.get("reason", ""))[:400], None
     except Exception as e:
@@ -429,7 +431,7 @@ async def grade_judge(judge_llm, rubric, convo):
     try:
         data = await judge_llm.chat_json(
             [{"role": "system", "content": _JUDGE_SYS}, {"role": "user", "content": prompt}],
-            temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=400, enable_thinking=True,
+            temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=DEFAULT_JUDGE_MAX_TOKENS, enable_thinking=True,
         )
         ft = data.get("failing_turn")
         ft = int(ft) if isinstance(ft, (int, float)) and 0 <= int(ft) < len(convo) else None
@@ -611,27 +613,52 @@ METRIC_DETECTORS = {"p40": "faithfulness", "p41": "self_consistency", "p42": "an
 
 _OBS_JUDGE_SYS = (
     "You are a strict QA rater for a voice-agent transcript. You are checking whether ONE "
-    "specific PROBLEM BEHAVIOUR occurred in this conversation. If the situation that would "
-    "trigger the problem never arose in this conversation, the problem did NOT occur. "
-    "Turns are numbered. Reply as JSON: "
-    '{"occurred": true|false, "reason": "<=14 words", "failing_turn": <turn number where it '
-    "occurred, or null>}."
+    "specific PROBLEM BEHAVIOUR occurred in this conversation. Turns are numbered.\n"
+    "Answer TWO separate questions:\n"
+    "  situation_arose — did this conversation ever create the situation that could trigger "
+    "the problem at all? (e.g. for 'agent will not end on a hard no', did the caller ever "
+    "actually refuse?) If the situation never came up, say false.\n"
+    "  occurred — given the situation DID arise, did the agent exhibit the problem?\n"
+    "If situation_arose is false, occurred must be false — a conversation that never tested "
+    "the behaviour is not evidence that the behaviour is fixed.\n"
+    'Reply as JSON: {"situation_arose": true|false, "occurred": true|false, '
+    '"reason": "<=14 words", "failing_turn": <turn number where it occurred, or null>}.'
 )
 
 
+class JudgeError(Exception):
+    """The judge could not be read — NOT a verdict either way.
+
+    observe_problem answers "did the problem OCCUR", so its False means CLEAN. Swallowing
+    an exception into False therefore marked the problem SOLVED on a judge crash, which is
+    the one direction that must never be guessed. grade_judge has the opposite polarity
+    (False = fail), so the same `return False` meant opposite things in the two paths.
+    Callers must decide explicitly; they can no longer inherit a verdict from a crash."""
+
+
 async def observe_problem(judge_llm, behaviour, convo):
-    """Did `behaviour` occur in this stored conversation? -> (occurred, reason, failing_turn)."""
+    """Did `behaviour` occur in this stored conversation?
+
+    -> (occurred, situation_arose, reason, failing_turn).
+
+    `situation_arose` is the honest half: a conversation in which the triggering
+    situation never came up is NOT evidence the problem is fixed, and a caller must
+    not count it as a clean pass (see the '~' handling in ForgeRunner._grade_sims)."""
     prompt = f"PROBLEM BEHAVIOUR: {behaviour}\n\nTRANSCRIPT:\n{convo_lines(convo, numbered=True)}"
     try:
         data = await judge_llm.chat_json(
             [{"role": "system", "content": _OBS_JUDGE_SYS}, {"role": "user", "content": prompt}],
-            temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=400, enable_thinking=True,
+            temperature=DEFAULT_JUDGE_TEMPERATURE, max_tokens=DEFAULT_JUDGE_MAX_TOKENS, enable_thinking=True,
         )
         ft = data.get("failing_turn")
         ft = int(ft) if isinstance(ft, (int, float)) and 0 <= int(ft) < len(convo) else None
-        return bool(data.get("occurred")), str(data.get("reason", ""))[:90], ft
+        occurred = bool(data.get("occurred"))
+        # default to "it was exercised" when the judge omits the field, so a missing key
+        # can never silently convert a real pass into an unknown
+        arose = bool(data.get("situation_arose", True)) or occurred
+        return occurred, arose, str(data.get("reason", ""))[:90], ft
     except Exception as e:
-        return False, f"judge_err {str(e)[:40]}", None
+        raise JudgeError(str(e)[:200]) from e
 
 
 def transcript_to_convo(transcript):
@@ -641,3 +668,37 @@ def transcript_to_convo(transcript):
         r = t.get("role")
         out.append(("A" if r == "agent" else "L" if r == "user" else "END", t.get("content") or ""))
     return out
+
+_PARAPHRASE_SYS = (
+    "You rewrite a caller's lines for a voice-agent test. Keep the SITUATION and the "
+    "caller's intent identical, change the WORDING completely — different vocabulary, "
+    "different sentence shape, same number of lines, same order, same meaning. Natural "
+    "spoken phone English. Reply JSON only: {\"lines\": [\"...\", ...]}."
+)
+
+
+async def heldout_scenario(llm, problem_id, seed=0):
+    """A FRESH phrasing of a problem's situation, for verification only.
+
+    Screening, deep-confirm and the skeptic otherwise all replay the same scripted
+    variants (10 of 31 problems have exactly one), so an edit keyed to those words
+    passes every gate. Paraphrasing at verify time gives an unlimited held-out set:
+    a fix that only matched the script fails here. Falls back to the scripted lines
+    if the paraphrase is unusable — never silently skips the check."""
+    sc = scenario_for(problem_id, 0)
+    if sc is None:
+        return None
+    lines, tools_on = sc
+    try:
+        data = await llm.chat_json(
+            [{"role": "system", "content": _PARAPHRASE_SYS},
+             {"role": "user", "content": json.dumps({"lines": list(lines)})}],
+            temperature=0.9, max_tokens=DEFAULT_JUDGE_MAX_TOKENS,
+            enable_thinking=False, seed=seed,
+        )
+        fresh = [str(x) for x in (data.get("lines") or []) if str(x).strip()]
+        if len(fresh) == len(lines):
+            return fresh, tools_on
+    except Exception:
+        pass
+    return lines, tools_on

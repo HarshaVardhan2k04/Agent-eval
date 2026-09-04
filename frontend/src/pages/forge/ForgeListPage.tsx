@@ -2,8 +2,9 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { T, card, btnPrimary } from '../../theme'
 import { score100Color, ScoreRing } from '../../components/analysis'
-import { RunStatusChip } from '../../components/forge'
+import { RunStatusChip, RunDuration } from '../../components/forge'
 import { useForgeStore, type ForgeRunSummary } from '../../stores/forgeStore'
+
 
 const LIVE = new Set(['collecting', 'optimizing'])
 
@@ -127,7 +128,8 @@ export function ForgeListPage() {
                   </div>
                 )}
                 <div style={{ fontSize: 12, color: T.faint, marginTop: 3 }}>
-                  {fmtDate(r.created_at)} · v{r.current_version} · {r.dataset_kind || '—'} dataset
+                  {fmtDate(r.created_at)} · v{r.current_version} · {r.dataset_kind || '—'} dataset{' · '}
+                  <RunDuration createdAt={r.created_at} completedAt={r.completed_at} live={LIVE.has(r.status)} />
                   {r.vertical ? ` · ${r.vertical}` : ''}
                 </div>
               </div>

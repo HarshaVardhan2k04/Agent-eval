@@ -4,7 +4,8 @@ import { T, card, label, verdictMeta } from '../../theme'
 import { api } from '../../api/client'
 import { useForgeStore } from '../../stores/forgeStore'
 import { RunStatusChip, LayerBadge, SolvedGauge, EscalationCard, VerdictCell,
-  ComboGate, CoachGuidancePanel, ComboScorecard, LiveStatusPanel } from '../../components/forge'
+  ComboGate, CoachGuidancePanel, ComboScorecard, LiveStatusPanel,
+  RunDuration } from '../../components/forge'
 
 type Ev = { id: number; event_type: string; event_data: Record<string, any>; created_at: string }
 
@@ -118,8 +119,14 @@ export function ForgeProgressPage() {
           )}
         </div>
       </div>
-      <p style={{ fontSize: 13, color: T.muted, margin: '6px 0 0' }}>
-        v{run.current_version} · {run.mode} · {run.solved_pct != null ? `${run.solved_pct}% of ${denom ?? '—'} problems solved` : 'baseline running'} · gate {gate}%
+      <p style={{ fontSize: 13, color: T.muted, margin: '6px 0 0', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'baseline' }}>
+        <span>
+          v{run.current_version} · {run.mode} · {run.solved_pct != null ? `${run.solved_pct}% of ${denom ?? '—'} problems solved` : 'baseline running'} · gate {gate}%
+        </span>
+        <span>·</span>
+        {/* total wall-clock: start -> handover to a human */}
+        <RunDuration createdAt={run.created_at} completedAt={run.completed_at}
+          live={isLive} label="took" />
       </p>
 
       <LiveStatusPanel events={events} runStatus={run.status} live={isLive} />
@@ -218,7 +225,9 @@ export function ForgeProgressPage() {
           </div>
           <div style={{ background: T.well, padding: '12px 15px', height: 460, overflowY: 'auto', fontFamily: T.mono, fontSize: 12, lineHeight: 1.7 }}>
             {events.length === 0 && <div style={{ color: T.fainter }}>Waiting for the engine…</div>}
-            {events.map((e) => <LogLine key={e.id} ev={e} />)}
+            {collapse(events).map((r) => ('g' in r
+              ? <GroupLine key={r.rid} g={r.g} />
+              : <LogLine key={r.rid} ev={r.ev} />))}
             {isLive && events.length > 0 && (
               <div style={{ color: T.purple, marginTop: 4 }}>
                 <span className="pulse-dot" style={{ display: 'inline-block', width: 7, height: 7, borderRadius: 99, background: T.purple, marginRight: 8 }} />
@@ -275,6 +284,107 @@ function LogLine({ ev }: { ev: Ev }) {
       break
     default:
       color = T.fainter
+  }
+  return <div style={{ color }}>{text}</div>
+}
+
+
+// ── LOG COLLAPSING ──────────────────────────────────────────────────────────
+// The engine emits one progress event PER SIM because the banner's progress bar
+// needs that resolution. Rendered one-line-each it buried the run: 27 lines to say
+// "8 problems clean, p20 failed 2 of 3". Group the per-sim chatter by problem and
+// print the roll-up. Nothing is dropped — the counts carry every event.
+type Group = {
+  phase: string; who: string
+  sims: number; turns: number; pass: number; fail: number
+  done: number | null; total: number | null; verdict: string | null
+}
+type Row = { rid: number; g: Group } | { rid: number; ev: Ev }
+
+// a stored sim's `kind` and a progress `phase` name the same stage differently
+const KIND_PHASE: Record<string, string> = {
+  deep_confirm: 'confirm_convos', stress: 'stress',
+  deepeval: 'deepeval', toolcheck: 'tool_checks',
+}
+
+function collapse(events: Ev[]): Row[] {
+  const rows: Row[] = []
+  let idx = new Map<string, number>()
+  for (const e of events) {
+    const d = e.event_data || {}
+    const collapsible = e.event_type === 'progress' || e.event_type === 'sim_recorded'
+    if (!collapsible) {
+      // a boundary (iteration_start, a version, a note) closes every open group, so
+      // the SAME problem judged again next iteration starts a fresh line
+      idx = new Map()
+      rows.push({ rid: e.id, ev: e })
+      continue
+    }
+    const phase = e.event_type === 'progress'
+      ? String(d.phase || '')
+      : (KIND_PHASE[String(d.kind || '')] || 'conversations')
+    // a tool check stores its sim as "<tool> · <phrasing>" but reports progress as
+    // "<tool>" — group on the tool so one tool is one line, not one per phrasing
+    let who = String(d.problem_id || d.probe || '')
+    if (phase === 'tool_checks') who = who.split(' · ')[0]
+    // Stress is a BULK phase: its sims are stored per persona but its progress counter
+    // carries no name, so grouping on the persona split one counter into ~55 nameless
+    // "1/?" lines. The run-wide counter is the only useful signal here — one line.
+    if (phase === 'stress') who = ''
+    const key = `${phase}|${who}`
+    let i = idx.get(key)
+    if (i == null) {
+      i = rows.length
+      idx.set(key, i)
+      rows.push({ rid: e.id, g: { phase, who, sims: 0, turns: 0, pass: 0, fail: 0, done: null, total: null, verdict: null } })
+    }
+    const row = rows[i]
+    if (!('g' in row)) continue
+    const g = row.g
+    if (e.event_type === 'sim_recorded') {
+      g.sims += 1
+      g.turns += Number(d.n_turns) || 0
+    } else {
+      if (typeof d.done === 'number') g.done = d.done
+      if (typeof d.total === 'number') g.total = d.total
+      if (d.verdict === 'pass') g.pass += 1
+      else if (d.verdict === 'fail') g.fail += 1
+      else if (d.verdict) g.verdict = String(d.verdict)
+    }
+  }
+  return rows
+}
+
+function GroupLine({ g }: { g: Group }) {
+  let color: string = T.faint
+  let text: string
+  const at = g.who ? ` · ${g.who}` : ''
+  switch (g.phase) {
+    case 'judging': {
+      const n = g.pass + g.fail
+      color = g.fail ? T.amber : T.faint
+      text = `judging${at} · ${g.pass}/${n} pass${g.fail ? ` · ${g.fail} FAILED` : ''}`
+      break
+    }
+    case 'conversations':
+    case 'confirm_convos': {
+      const label = g.phase === 'conversations' ? 'conversations' : 'deep-confirm'
+      const avg = g.sims ? Math.round(g.turns / g.sims) : 0
+      text = `${label}${at} · ${g.sims || g.done || 0} sims${avg ? ` · ~${avg} turns` : ''}`
+      break
+    }
+    case 'tool_checks':
+      color = g.verdict && g.verdict !== 'called' ? T.amber : T.faint
+      text = `tool check${at}${g.verdict ? ` → ${g.verdict}` : ''}`
+      break
+    case 'stress':
+      text = `stress sims · ${g.done ?? g.sims}/${g.total ?? g.sims}`
+      break
+    case 'deepeval':
+      text = `deepeval${at} · ${g.done ?? 0}/${g.total ?? '?'}`
+      break
+    default:
+      text = `${g.phase}${at} · ${g.done ?? g.sims}${g.total ? `/${g.total}` : ''}`
   }
   return <div style={{ color }}>{text}</div>
 }

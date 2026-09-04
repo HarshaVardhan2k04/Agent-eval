@@ -10,6 +10,8 @@ Standalone mode has no layers: the coach edits the single blob with append/prepe
 """
 from __future__ import annotations
 
+import re
+
 from src.config import DEFAULT_COACH_TEMPERATURE, DEFAULT_COACH_PATCH_MAX_TOKENS
 from src.forge.merge import deep_merge
 
@@ -416,3 +418,38 @@ def apply_layer_edits(layer_obj: dict, edits) -> tuple[dict, int]:
                 _set_path(out, e["path"], [e["text"]] if cur is None else [cur, e["text"]])
             applied += 1
     return out, applied
+
+# ── GENERALISATION GUARD ────────────────────────────────────────────────────
+# The detectors drive SCRIPTED lead lines, so the cheapest way to turn a problem
+# green is to write a rule keyed to the script's exact words ("if the caller says
+# 'not interested', end the call"). That passes every gate and fixes nothing real:
+# a caller who says it differently still gets the bug. Reject an edit that quotes
+# the probe instead of stating the principle behind it.
+_STOP = {"the","a","an","and","or","to","of","in","is","it","you","i","that","this",
+         "for","on","with","not","do","be","if","as","at","so","me","my","your"}
+
+
+def _norm_words(text):
+    return [w for w in re.findall(r"[a-z']+", str(text).lower())]
+
+
+def probe_leak(edits, lead_lines, n=4):
+    """Return the offending phrase if an edit quotes >= n consecutive content words
+    from a scripted lead line, else None. n=4 lets an edit mention a short natural
+    phrase while catching a rule built around the probe's sentence."""
+    edit_text = " ".join(
+        str(e.get("text") or e.get("replace") or e.get("value") or "") for e in (edits or []))
+    hay = _norm_words(edit_text)
+    if not hay:
+        return None
+    hay_grams = {tuple(hay[i:i + n]) for i in range(len(hay) - n + 1)}
+    for line in lead_lines or []:
+        words = _norm_words(line)
+        content = [w for w in words if w not in _STOP]
+        if len(content) < 2:
+            continue          # "hmm" / "ok" probes carry no wording to copy
+        for i in range(len(words) - n + 1):
+            gram = tuple(words[i:i + n])
+            if sum(1 for w in gram if w not in _STOP) >= 2 and gram in hay_grams:
+                return " ".join(gram)
+    return None

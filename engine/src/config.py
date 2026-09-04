@@ -18,7 +18,12 @@ CALLBACK_BASE_URL = os.environ.get("CALLBACK_BASE_URL", "http://localhost:3001")
 DEFAULT_MAX_ITERATIONS = 5
 DEFAULT_QUALITY_THRESHOLD = 0.9
 DEFAULT_CONCURRENT_SCENARIOS = 4
-DEFAULT_MAX_LLM_CONCURRENCY = 8
+# Measured against the live box at 8 / 16 / 30 concurrent judge calls: all succeeded,
+# but throughput plateaued (0.84 -> 0.97 -> 0.98 req/s) while per-call latency scaled
+# linearly (p50 6.4s -> 11.1s -> 15.9s) — the GPU is compute-bound, not connection-bound,
+# so past ~16 you mostly queue. The big win was serial -> parallel judging (8x), not
+# 8 -> 30. Override with MAX_LLM_CONCURRENCY when the box is idle or bigger.
+DEFAULT_MAX_LLM_CONCURRENCY = int(os.environ.get("MAX_LLM_CONCURRENCY", "16"))
 DEFAULT_AGENT_TEMPERATURE = 0.0   # deterministic agent turns — a verdict shouldn't move on sampling luck
 DEFAULT_JUDGE_TEMPERATURE = 0.4   # judge thinks; a little sampling room reads evidence better
 DEFAULT_RESOLVER_TEMPERATURE = 0.3
@@ -27,8 +32,19 @@ DEFAULT_RESOLVER_TEMPERATURE = 0.3
 # way the judge gets them. 0.0 made it repeat the same dead-end edit after a revert.
 DEFAULT_COACH_TEMPERATURE = 0.4
 DEFAULT_USER_TEMPERATURE = 0.7
-DEFAULT_MAX_TOKENS = 300
-DEFAULT_JUDGE_MAX_TOKENS = 3000          # judge runs with thinking on, needs room to reason
+# The agent under test must get the SAME answer budget production gives it, or Forge
+# is scoring a different model. Production's Gemma provider row is
+#   {"model":"google/gemma-4-26B-A4B-it","temperature":0.7,"max_tokens":1024,...}
+# (agent-server-dev migrations/20260501000000-add-gemma5090-provider.js). A tighter cap
+# truncates agent turns mid-sentence, which quietly makes verbosity problems (p39)
+# undetectable and manufactures abrupt endings that production would never produce.
+DEFAULT_MAX_TOKENS = 1024
+# Thinking burns the SAME budget as the answer. Measured: a 5-turn transcript needs
+# ~400 completion tokens to think AND emit the JSON, so a 400 cap finished with
+# finish_reason='length' and an object cut off mid-string, which chat_json could only
+# report as a parse error. EVERY thinking judge call uses this — do not pass a small
+# literal instead (the forge detectors did, and silently mis-scored every long call).
+DEFAULT_JUDGE_MAX_TOKENS = 8000          # judge runs with thinking on, needs room to reason
 DEFAULT_COACH_PATCH_MAX_TOKENS = 3000    # coach patch pass (thinking on, small edits out)
 DEFAULT_RESOLVER_MAX_TOKENS = 16000      # full-rewrite escalation only (thinking off)
 

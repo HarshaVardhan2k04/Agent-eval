@@ -77,6 +77,17 @@ export interface ForgeRunDetail extends ForgeRunSummary {
   review: Record<string, unknown>
   layers: ForgeLayerPin[]
   error_message: string | null
+  // why each still-open problem is not solved — written when the run finishes
+  unsolved_json: Record<string, UnsolvedReason> | null
+}
+
+export interface UnsolvedReason {
+  verdict: string | null
+  category: 'regression' | 'refuted' | 'retry_budget' | 'needs_you' | 'not_exercised'
+    | 'unknown' | 'no_detector' | 'iteration_budget' | 'in_progress'
+  why: string
+  attempts: number
+  evidence: string
 }
 
 export interface GlobalProblem {

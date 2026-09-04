@@ -134,7 +134,7 @@ export function ForgeSetupPage() {
       setAgentTest(r.ok ? `✓ replied in ${r.ms}ms` : `✕ ${r.error}`)
     } catch { setAgentTest('✕ request failed') }
   }
-  const [maxIter, setMaxIter] = usePersisted('forge:scoreMaxIter.v2', 5)
+  const [maxIter, setMaxIter] = usePersisted('forge:scoreMaxIter.v3', 24)
   const [gatePct, setGatePct] = usePersisted('forge:scoreGate', 95)
   const [stressTarget, setStressTarget] = usePersisted('forge:scoreStress', 120)
 
@@ -252,7 +252,7 @@ export function ForgeSetupPage() {
         name: name.trim() || null, mode, direction, lead_status: leadStatus,
         coach_guidance: coachGuidance.trim() || null,
         dataset_kind: datasetKind,
-        scoring: { best_of_n: 1, votes, confirm_votes: 5, max_iterations: maxIter, gate_pct: gatePct, stress_target: stressTarget },
+        scoring: { best_of_n: 1, votes, confirm_votes: 5, max_iterations: maxIter, gate_pct: gatePct, stress_target: stressTarget, max_attempts_per_problem: 2 },
       }
       body.tools = [...CORE_LOCKED, ...gatedTools]
       ;(body.scoring as Record<string, unknown>).tool_checks = toolChecks

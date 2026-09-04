@@ -17,7 +17,13 @@ const PROBLEM_ORDER = [[literal("NULLIF(regexp_replace(id, '\\D', '', 'g'), ''):
 
 const DEFAULT_SCORING = {
   best_of_n: 1, votes: 3, confirm_votes: 5, gate_pct: 95, stress_target: 120, milestone_every: 2,
-  max_iterations: 5, plateau_patience: 3, verify_k: 3, composite_margin: 3.0,
+  // Each iteration fixes at most ONE problem cluster, so the iteration budget is the
+  // hard ceiling on how much of the matrix a run can close. At 5, a 35-problem gate
+  // could never get near "most problems solved" no matter how good the coach was.
+  // max_attempts_per_problem retires a problem that keeps failing so the budget is
+  // spent breadth-first instead of on one stubborn fix (see test 234).
+  max_iterations: 24, plateau_patience: 3, max_attempts_per_problem: 2,
+  verify_k: 3, composite_margin: 3.0,
 };
 
 // A problem applies to a run unless its applicability narrows it out.
@@ -713,6 +719,9 @@ async function resolveCombos(req, res) {
 
   await run.update({
     status: 'optimizing', coach_guidance: guidance,
+    // back to work: the end time is re-stamped when it next stops, so the reported
+    // duration is always start -> the handover that actually finished the run
+    completed_at: null,
     combos_json: { ...cj, resolutions, blocked: [] }, updated_at: new Date(),
   });
 
@@ -779,7 +788,40 @@ async function deleteRun(req, res) {
 
 async function stopRun(req, res) {
   try { await forgeEngine.stopForge(req.params.id); } catch (_e) { /* best-effort */ }
-  await ForgeRun.update({ status: 'stopped', updated_at: new Date() }, { where: { id: req.params.id } });
+  // stopping ends the run, so the clock stops here too — otherwise a stopped run is the
+  // one terminal state with no duration
+  const patch = { status: 'stopped', updated_at: new Date() };
+  // The engine writes the real per-problem unsolved report on run_complete, but it only
+  // notices the stop flag between iterations — and if the process is killed first (restart,
+  // crash) that report never arrives. Reconstruct what the stored verdicts can tell us so a
+  // stopped run still accounts for its gap instead of showing nothing.
+  const run = await ForgeRun.findByPk(req.params.id);
+  // never move an end time that is already recorded — stopping twice must not restate
+  // how long the run took
+  if (!run?.completed_at) patch.completed_at = new Date();
+  if (run && !Object.keys(run.unsolved_json || {}).length) {
+    const latest = await ForgeVersion.findOne({
+      where: { run_id: run.id, statuses_json: { [Op.ne]: null } }, order: [['version', 'DESC']],
+    });
+    const statuses = latest?.statuses_json || {};
+    const unsolved = {};
+    for (const pid of run.denominator_snapshot_json || []) {
+      const st = statuses[pid] || {};
+      if (st.verdict === 'Y') continue;
+      const ev = String(st.evidence || '');
+      unsolved[pid] = {
+        verdict: st.verdict ?? null,
+        category: st.verdict === '~' ? (ev.includes('never exercised') ? 'not_exercised' : 'unknown')
+          : st.verdict === 'N' ? 'in_progress' : 'iteration_budget',
+        why: st.verdict
+          ? (ev || 'still failing when the run was stopped')
+          : 'the run was stopped before this problem was reached',
+        attempts: 0, evidence: ev.slice(0, 160),
+      };
+    }
+    patch.unsolved_json = unsolved;
+  }
+  await ForgeRun.update(patch, { where: { id: req.params.id } });
   res.json({ id: req.params.id, status: 'stopped' });
 }
 
@@ -926,6 +968,10 @@ async function ingestForgeEvent(req, res) {
       const run = await ForgeRun.findByPk(runId);
       await ForgeRun.update({
         status: 'awaiting_human',
+        // The run HALTS here waiting on a person, so this is where the machine clock
+        // stops — the duration a user cares about is start -> handover, and without
+        // this a gated run had no end time at all.
+        completed_at: new Date(),
         combos_json: { ...(run.combos_json || {}), stages: data.stages,
           blocked: data.blocked || [], gate_message: data.message },
         updated_at: new Date(),
@@ -935,11 +981,16 @@ async function ingestForgeEvent(req, res) {
       // the human_gate handler already set awaiting_human; don't overwrite it with a
       // terminal-looking status or the resume button disappears.
       if (data.status === 'needs_human_combo') {
-        await ForgeRun.update({ updated_at: new Date() }, { where: { id: runId } });
+        const halted = await ForgeRun.findByPk(runId);
+        await ForgeRun.update(
+          { updated_at: new Date(), completed_at: halted?.completed_at || new Date() },
+          { where: { id: runId } });
         return res.json({ ok: true });
       }
       const patch = { status: data.status, current_version: data.final_version, completed_at: new Date(), updated_at: new Date() };
       if (data.solved_pct != null) patch.solved_pct = data.solved_pct;
+      // why each remaining problem is unsolved — the run's account of its own gap
+      if (data.unsolved && typeof data.unsolved === 'object') patch.unsolved_json = data.unsolved;
       if (data.error) patch.error_message = String(data.error).slice(0, 1000); // the card shows this
       await ForgeRun.update(patch, { where: { id: runId } });
 

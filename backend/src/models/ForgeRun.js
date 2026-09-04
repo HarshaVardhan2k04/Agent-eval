@@ -26,6 +26,8 @@ module.exports = (sequelize, DataTypes) =>
       // {stages, combos, allocation, blocked, resolutions, results} — the direction x
       // lead_status cross-product this run covers, and the human's rulings on gaps.
       combos_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+      // per-problem reason a run finished below the gate (see the migration)
+      unsolved_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
       // operator's live instructions to the coach, per run, editable mid-run
       coach_guidance: { type: DataTypes.TEXT, allowNull: true },
       final_composite: { type: DataTypes.REAL, allowNull: true },
