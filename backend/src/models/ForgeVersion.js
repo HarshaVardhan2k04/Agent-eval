@@ -20,6 +20,9 @@ module.exports = (sequelize, DataTypes) =>
       statuses_json: { type: DataTypes.JSONB, allowNull: true },
       section_scores_json: { type: DataTypes.JSONB, allowNull: true },
       metrics_json: { type: DataTypes.JSONB, allowNull: true },
+      // at-scale habit percentages from the stress battery (yapping, bot-words, spoken
+      // digits, formatting chars, repeat loops). null = stress did not run.
+      stress_json: { type: DataTypes.JSONB, allowNull: true },
       tool_checks_json: { type: DataTypes.JSONB, allowNull: true }, // {tool:{verdict,...}}
       latency_json: { type: DataTypes.JSONB, allowNull: true }, // {avg_ms,p50_ms,p99_ms,n_turns,detail}
       edits_json: { type: DataTypes.JSONB, allowNull: true },

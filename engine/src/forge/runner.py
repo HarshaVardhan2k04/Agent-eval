@@ -350,7 +350,8 @@ class ForgeRunner:
         sims = []  # {sim_uid, pid, idx, convo, ended}
         total = len(convo_pids) * votes
         done = 0
-        sem = asyncio.Semaphore(8)
+        # same bound as judging — one knob for how hard we push the box (config.py)
+        sem = asyncio.Semaphore(DEFAULT_MAX_LLM_CONCURRENCY)
 
         async def one(pid, k):
             async with sem:
@@ -438,29 +439,50 @@ class ForgeRunner:
                                                  "verdict": "pass" if ok else "fail"})
                 return sim, bool(ok), reason, fturn
 
+        # ONE gather over EVERY sim in the matrix, not one gather per problem. Grouping
+        # first and awaiting inside the loop capped the real concurrency at `votes`
+        # (2-3), so the 16-slot semaphore sat almost empty and a 62-sim matrix still took
+        # ~20 minutes. Fan out across problems; the semaphore is what bounds the GPU.
+        jobs = []
         for pid, group in by_pid.items():
-            if self._stopped:
-                break
-            results, uids, fails = [], [], []
-            ordered = sorted(group, key=lambda x: x["idx"])
-            for sim, ok, reason, fturn in await asyncio.gather(*(_judge_one(pid, s) for s in ordered)):
-                results.append(bool(ok))
-                uids.append(sim["sim_uid"])
-                if not ok:
-                    fails.append({"sim_uid": sim["sim_uid"], "reason": reason, "failing_turn": fturn})
-            passes = sum(results)
-            n = len(results)
-            ev = (fails[0]["reason"] if fails else "ok")
+            for sim in sorted(group, key=lambda x: x["idx"]):
+                jobs.append((pid, sim))
+        graded_rows = await asyncio.gather(*(_judge_one(pid, sim) for pid, sim in jobs))
+
+        per_pid = {}
+        for (pid, _sim), (sim, ok, reason, fturn) in zip(jobs, graded_rows):
+            r = per_pid.setdefault(pid, {"results": [], "uids": [], "fails": []})
+            r["results"].append(bool(ok))
+            r["uids"].append(sim["sim_uid"])
+            if not ok:
+                r["fails"].append({"sim_uid": sim["sim_uid"], "reason": reason, "failing_turn": fturn})
+        for pid, r in per_pid.items():
+            passes, n = sum(r["results"]), len(r["results"])
+            ev = (r["fails"][0]["reason"] if r["fails"] else "ok")
             out[pid] = {"verdict": fdet.verdict_from_votes(passes, n), "passes": passes, "votes": n,
-                        "evidence": f"{passes}/{n} {ev}", "sim_uids": uids, "fails": fails[:5]}
-        # prompt-structure problems: judged once against the prompt text (deterministic)
-        for pid in problem_ids:
-            if pid in fdet.PROMPT_JUDGE_DETECTORS and pid not in out:
-                ok, ev, _ft = await fdet._prompt_judge(judge, system_prompt, fdet.PROMPT_JUDGE_DETECTORS[pid])
-                passes = votes if ok else 0
-                out[pid] = {"verdict": fdet.verdict_from_votes(passes, votes), "passes": passes,
-                            "votes": votes, "evidence": ev, "sim_uids": [], "source": "prompt_text",
-                            "fails": ([] if ok else [{"sim_uid": None, "reason": ev, "failing_turn": None}])}
+                        "evidence": f"{passes}/{n} {ev}", "sim_uids": r["uids"], "fails": r["fails"][:5]}
+
+        # prompt-structure problems: judged once against the prompt text (deterministic).
+        # Also concurrent — these are independent single calls, one per problem.
+        text_pids = [pid for pid in problem_ids
+                     if pid in fdet.PROMPT_JUDGE_DETECTORS and pid not in out]
+
+        async def _judge_text(pid):
+            async with sem:
+                if self._stopped:
+                    return pid, False, "stopped"
+                try:
+                    ok, ev, _ft = await fdet._prompt_judge(judge, system_prompt,
+                                                          fdet.PROMPT_JUDGE_DETECTORS[pid])
+                except Exception as e:
+                    ok, ev = False, f"grade_err {str(e)[:40]}"
+                return pid, bool(ok), ev
+
+        for pid, ok, ev in await asyncio.gather(*(_judge_text(p) for p in text_pids)):
+            passes = votes if ok else 0
+            out[pid] = {"verdict": fdet.verdict_from_votes(passes, votes), "passes": passes,
+                        "votes": votes, "evidence": ev, "sim_uids": [], "source": "prompt_text",
+                        "fails": ([] if ok else [{"sim_uid": None, "reason": ev, "failing_turn": None}])}
         return out
 
     async def _run_matrix(self, system_prompt, greeting, problem_ids, votes, kind="detector"):
@@ -975,6 +997,11 @@ class ForgeRunner:
         stress_target = int(scoring.get("stress_target", 120))
         milestone_every = int(scoring.get("milestone_every", 2))
         max_iterations = int(scoring.get("max_iterations", 12))
+        # VERIFY-ONLY: measure the prompt exactly as given and stop. Same v0 pipeline as
+        # an optimize run (tool checks, matrix, deep-confirm, stress, deepeval) so the two
+        # are directly comparable — but no coach, no edits, no accepted version. The
+        # deliverable is the problem list, not a better prompt.
+        verify_only = str(scoring.get("objective") or spec.get("objective") or "optimize") == "verify"
         patience = int(scoring.get("plateau_patience", 3))
         margin = float(scoring.get("composite_margin", 3.0))
 
@@ -1158,7 +1185,7 @@ class ForgeRunner:
             # the endings lesson, generalised: a failing tool check is the cleanest fix
             # target there is — scripted situation, unambiguous action, proven lever.
             # Coach it now so the matrix and sims run against a prompt whose tools fire.
-            if tchecks.failing(base_tool_checks) and scoring.get("fix_tools", True):
+            if tchecks.failing(base_tool_checks) and scoring.get("fix_tools", True) and not verify_only:
                 champion, base_tool_checks, tool_fixes, sp, greeting = \
                     await self._fix_tool_calls(mode, champion, base_tool_checks,
                                                sp, greeting, direction, lead_status)
@@ -1198,6 +1225,18 @@ class ForgeRunner:
             "config_json": (champion.get("layers") if mode == "layered" else {"blob": champion.get("blob")}),
             "merged_markdown": sp, "greeting": greeting,
         })
+
+        if verify_only:
+            solved_pct = self._solved_pct(statuses, denominator)
+            unsolved = self._unsolved_reasons(statuses, denominator, targetable, set(), {},
+                                              {}, max_iterations, objective="verify")
+            await self.bus.emit("run_complete", {
+                "run_id": self.run_id, "status": "verified", "solved_pct": solved_pct,
+                "final_version": 0, "parked": [], "unsolved": unsolved,
+                "champion": (champion.get("layers") if mode == "layered" else {"blob": champion.get("blob")}),
+            })
+            return {"status": "verified", "solved_pct": solved_pct, "version": 0,
+                    "unsolved": unsolved}
 
         version = 0
         self._cur_version = 0
@@ -1486,7 +1525,7 @@ class ForgeRunner:
 
     @staticmethod
     def _unsolved_reasons(statuses, denominator, targetable, parked, park_reason,
-                          attempts_by_pid, max_iterations):
+                          attempts_by_pid, max_iterations, objective="optimize"):
         """One plain-language reason per unsolved problem, in priority order.
 
         The categories are what a human needs in order to act: `retry_budget` and
@@ -1512,6 +1551,9 @@ class ForgeRunner:
                 cat, why = "unknown", ev or "no usable verdict"
             elif pid not in targetable:
                 cat, why = "no_detector", (ev or "no scripted detector — verdict comes from at-scale signals only")
+            elif objective == "verify":
+                # No coach ran, so "never attempted" is the design, not a shortfall.
+                cat, why = "found", "found by verification — no fix was attempted (verify-only run)"
             elif not attempts_by_pid.get(pid):
                 cat, why = "iteration_budget", (
                     f"never attempted — the run used its {max_iterations}-iteration budget on "

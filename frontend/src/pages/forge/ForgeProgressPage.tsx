@@ -5,11 +5,11 @@ import { api } from '../../api/client'
 import { useForgeStore } from '../../stores/forgeStore'
 import { RunStatusChip, LayerBadge, SolvedGauge, EscalationCard, VerdictCell,
   ComboGate, CoachGuidancePanel, ComboScorecard, LiveStatusPanel,
-  RunDuration } from '../../components/forge'
+  RunDuration, isVerifyRun } from '../../components/forge'
 
 type Ev = { id: number; event_type: string; event_data: Record<string, any>; created_at: string }
 
-const TERMINAL = new Set(['llm_complete', 'finalized', 'converged_below_gate', 'stopped', 'failed'])
+const TERMINAL = new Set(['llm_complete', 'finalized', 'converged_below_gate', 'stopped', 'failed', 'verified'])
 
 // Poll the forge_events cursor — the app's proven live pattern (works during AND after a run).
 export function ForgeProgressPage() {
@@ -82,6 +82,7 @@ export function ForgeProgressPage() {
   const openEsc = (run?.escalations || []).filter((e) => e.status === 'open')
   const denom = run?.denominator_snapshot_json?.length ?? null
   const gate = Number(run?.scoring_json?.gate_pct ?? 95)
+  const verify = isVerifyRun(run)
 
   if (!run) return <div style={{ color: T.faint, padding: 20 }}>Loading…</div>
 
@@ -93,7 +94,7 @@ export function ForgeProgressPage() {
       </button>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
         <h1 style={{ fontSize: 25, fontWeight: 650, margin: 0, color: T.text }}>{run.name || run.id}</h1>
-        <RunStatusChip status={run.status} />
+        <RunStatusChip status={run.status} label={verify && isLive ? 'Verifying' : undefined} />
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {isLive && (
             <button onClick={() => stopRun(run.id)}
@@ -111,7 +112,7 @@ export function ForgeProgressPage() {
               View results →
             </button>
           )}
-          {(run.status === 'awaiting_human' || run.status === 'llm_complete' || run.status === 'converged_below_gate') && (
+          {!verify && (run.status === 'awaiting_human' || run.status === 'llm_complete' || run.status === 'converged_below_gate') && (
             <button onClick={() => nav(`/forge/${run.id}/review`)}
               style={{ padding: '9px 16px', borderRadius: 10, border: 'none', background: T.purple, color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
               Human review →
@@ -121,7 +122,9 @@ export function ForgeProgressPage() {
       </div>
       <p style={{ fontSize: 13, color: T.muted, margin: '6px 0 0', display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'baseline' }}>
         <span>
-          v{run.current_version} · {run.mode} · {run.solved_pct != null ? `${run.solved_pct}% of ${denom ?? '—'} problems solved` : 'baseline running'} · gate {gate}%
+          {verify
+            ? `verify only · ${run.mode} · ${run.solved_pct != null ? `${run.solved_pct}% of ${denom ?? '—'} problems clean` : 'measuring'}`
+            : `v${run.current_version} · ${run.mode} · ${run.solved_pct != null ? `${run.solved_pct}% of ${denom ?? '—'} problems solved` : 'baseline running'} · gate ${gate}%`}
         </span>
         <span>·</span>
         {/* total wall-clock: start -> handover to a human */}
@@ -129,7 +132,7 @@ export function ForgeProgressPage() {
           live={isLive} label="took" />
       </p>
 
-      <LiveStatusPanel events={events} runStatus={run.status} live={isLive} />
+      <LiveStatusPanel events={events} runStatus={run.status} live={isLive} verify={verify} />
 
       {run.status === 'awaiting_human' && ((run as any).combos_json?.blocked || []).length > 0 && (
         <div style={{ marginTop: 18 }}>

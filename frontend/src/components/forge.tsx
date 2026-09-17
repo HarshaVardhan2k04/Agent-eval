@@ -745,6 +745,9 @@ const TERMINAL_META: Record<string, { title: string; blurb: string; color: strin
   converged_below_gate: { title: 'Converged below the gate', blurb: 'The coach ran out of moves before reaching the gate. The problems still open are in the results.', color: T.amber },
   awaiting_human: { title: 'Waiting on you', blurb: 'The run is paused on something it will not decide by itself.', color: T.purple },
   finalized: { title: 'Finalized', blurb: 'A human has signed this prompt off.', color: T.green },
+  // A verify run ENDS here by design. Do not word this as a shortfall — the solved%
+  // is the finding, not the grade, and no coach was ever supposed to run.
+  verified: { title: 'Verification complete', blurb: 'The prompt was measured exactly as you wrote it. Every problem it has is listed in the results, with the conversation that proves it.', color: T.blue },
 }
 
 // The visible spine of a run, in the order runner.py walks it.
@@ -757,6 +760,13 @@ const PIPELINE: [string, string][] = [
   ['deepeval', 'Metrics'],
   ['coaching', 'Coaching'],
 ]
+
+/** Is this run measure-only? The objective lives in scoring_json so no migration was
+ *  needed; `verified` covers a finished one whose scoring row is absent (older API). */
+export function isVerifyRun(run: { status?: string; scoring_json?: Record<string, unknown> } | null | undefined) {
+  if (!run) return false
+  return run.status === 'verified' || (run.scoring_json || {}).objective === 'verify'
+}
 
 type ForgeEventLike = { event_type: string; event_data: Record<string, unknown>; created_at: string }
 
@@ -846,11 +856,14 @@ function humanDur(ms: number) {
   return `${Math.floor(m / 60)}h ${m % 60}m`
 }
 
-export function LiveStatusPanel({ events, runStatus, live }: {
+export function LiveStatusPanel({ events, runStatus, live, verify }: {
   events: ForgeEventLike[]
   runStatus: string
   live: boolean
+  /** verify-only run — there is no coaching stage, so don't draw one greyed out forever. */
+  verify?: boolean
 }) {
+  const pipeline = verify ? PIPELINE.filter(([k]) => k !== 'coaching') : PIPELINE
   const now = deriveNow(events)
   // A ticking clock so "elapsed" advances between events, not only when one lands.
   // Seeded to 0 rather than Date.now() — reading the clock during render is impure,
@@ -877,7 +890,7 @@ export function LiveStatusPanel({ events, runStatus, live }: {
     if (left > 1500) eta = `~${humanDur(left)} left`
   }
 
-  const curIdx = PIPELINE.findIndex(([k]) => k === key)
+  const curIdx = pipeline.findIndex(([k]) => k === key)
 
   return (
     <div style={{ ...card, padding: 0, marginTop: 16, overflow: 'hidden', display: 'flex' }}>
@@ -920,7 +933,7 @@ export function LiveStatusPanel({ events, runStatus, live }: {
 
         {/* the spine — which stages this run has already been through */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 13, flexWrap: 'wrap' }}>
-          {PIPELINE.map(([k, lbl], i) => {
+          {pipeline.map(([k, lbl], i) => {
             const isCur = k === key
             const isPast = curIdx >= 0 ? i < curIdx : now.seen.has(k)
             const c = isCur ? meta.color : isPast ? T.text3 : T.fainter

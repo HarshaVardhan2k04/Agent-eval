@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { T, card, btnPrimary } from '../../theme'
 import { score100Color, ScoreRing } from '../../components/analysis'
-import { RunStatusChip, RunDuration } from '../../components/forge'
+import { RunStatusChip, RunDuration, isVerifyRun } from '../../components/forge'
 import { useForgeStore, type ForgeRunSummary } from '../../stores/forgeStore'
 
 
@@ -26,6 +26,7 @@ export function ForgeListPage() {
     { key: 'all', label: 'All', match: () => true },
     { key: 'active', label: 'Active', match: (r) => LIVE.has(r.status) || r.status === 'awaiting_human' },
     { key: 'llm_complete', label: 'LLM-complete', match: (r) => r.status === 'llm_complete' || r.status === 'converged_below_gate' },
+    { key: 'verified', label: 'Verified', match: (r) => isVerifyRun(r) },
     { key: 'review', label: 'In review', match: (r) => r.status === 'human_review' },
     { key: 'finalized', label: 'Finalized', match: (r) => r.status === 'finalized' },
   ]
@@ -139,7 +140,8 @@ export function ForgeListPage() {
                 </div>
                 <div style={{ fontSize: 10.5, color: T.fainter, textTransform: 'uppercase', letterSpacing: '0.05em' }}>composite</div>
               </div>
-              <RunStatusChip status={r.status} />
+              <RunStatusChip status={r.status}
+                label={isVerifyRun(r) && LIVE.has(r.status) ? 'Verifying' : undefined} />
               <div style={{ display: 'flex', gap: 6 }} onClick={(e) => e.stopPropagation()}>
                 {confirmDel === r.id ? (
                   <>

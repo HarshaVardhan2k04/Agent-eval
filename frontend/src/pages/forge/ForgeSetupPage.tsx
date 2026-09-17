@@ -43,6 +43,7 @@ export function ForgeSetupPage() {
   const nav = useNavigate()
 
   // drafts survive navigation (usePersisted, ae:forge:*)
+  const [objective, setObjective] = usePersisted<'optimize' | 'verify'>('forge:objective', 'optimize')
   const [mode, setMode] = usePersisted<'standalone' | 'layered'>('forge:mode', 'standalone')
   const [name, setName] = usePersisted('forge:name', '')
   const [blob, setBlob] = usePersisted('forge:standaloneBlob', '')
@@ -134,6 +135,26 @@ export function ForgeSetupPage() {
       setAgentTest(r.ok ? `✓ replied in ${r.ms}ms` : `✕ ${r.error}`)
     } catch { setAgentTest('✕ request failed') }
   }
+  // The JUDGE knob. One model plays three parts — grader, coach, and the simulated
+  // human on the other end of every call — so this swaps all three at once.
+  const [judgeCustom, setJudgeCustom] = usePersisted('forge:judgeCustom', false)
+  const [judgeCfg, setJudgeCfg] = usePersisted('forge:judgeCfg', { base_url: '', model: '', api_key: '' })
+  const [judgeSaved, setJudgeSaved] = usePersisted('forge:judgeSavedId', '')
+  const [judgeTest, setJudgeTest] = useState<string | null>(null)
+  const pickJudgeSaved = (lid: string) => {
+    setJudgeSaved(lid)
+    const l = savedLlms.find((x) => x.id === lid)
+    if (l) setJudgeCfg({ base_url: l.base_url, model: l.model, api_key: '' })
+  }
+  const testJudge = async () => {
+    setJudgeTest('testing…')
+    try {
+      const r = await api.testArenaLlm({ base_url: judgeCfg.base_url.trim(), model: judgeCfg.model.trim(),
+        api_key: judgeCfg.api_key.trim() || undefined })
+      setJudgeTest(r.ok ? `✓ replied in ${r.ms}ms` : `✕ ${r.error}`)
+    } catch { setJudgeTest('✕ request failed') }
+  }
+
   const [maxIter, setMaxIter] = usePersisted('forge:scoreMaxIter.v3', 24)
   const [gatePct, setGatePct] = usePersisted('forge:scoreGate', 95)
   const [stressTarget, setStressTarget] = usePersisted('forge:scoreStress', 120)
@@ -243,6 +264,7 @@ export function ForgeSetupPage() {
       : { label: `Personas valid (${personas.length})`, ok: personas.length > 0 && !personasError },
   ]
   const ready = checks.every((c) => c.ok)
+  const verifyOnly = objective === 'verify'
 
   const launch = async () => {
     if (!ready || launching) return
@@ -252,6 +274,7 @@ export function ForgeSetupPage() {
         name: name.trim() || null, mode, direction, lead_status: leadStatus,
         coach_guidance: coachGuidance.trim() || null,
         dataset_kind: datasetKind,
+        objective,
         scoring: { best_of_n: 1, votes, confirm_votes: 5, max_iterations: maxIter, gate_pct: gatePct, stress_target: stressTarget, max_attempts_per_problem: 2 },
       }
       body.tools = [...CORE_LOCKED, ...gatedTools]
@@ -259,6 +282,10 @@ export function ForgeSetupPage() {
       if (agentCustom && agentCfg.base_url.trim() && agentCfg.model.trim()) {
         body.agent_llm = { base_url: agentCfg.base_url.trim(), model: agentCfg.model.trim(),
                            api_key: agentCfg.api_key.trim() || undefined }
+      }
+      if (judgeCustom && judgeCfg.base_url.trim() && judgeCfg.model.trim()) {
+        body.judge_llm = { base_url: judgeCfg.base_url.trim(), model: judgeCfg.model.trim(),
+                           api_key: judgeCfg.api_key.trim() || undefined }
       }
       if (mode === 'standalone') body.standalone_prompt = blob
       else body.layers = {
@@ -290,8 +317,36 @@ export function ForgeSetupPage() {
       <button onClick={() => nav('/forge')} style={backBtn}>← Back to runs</button>
       <h1 style={{ fontSize: 27, fontWeight: 650, margin: 0, color: T.text }}>New run</h1>
       <p style={{ fontSize: 14, color: T.muted, margin: '7px 0 0' }}>
-        Pick the prompt shape, give it a dataset, and Forge iterates until the judge can't improve it.
+        {verifyOnly
+          ? "Measure the prompt exactly as you wrote it and report every problem it has. Nothing is edited."
+          : "Pick the prompt shape, give it a dataset, and Forge iterates until the judge can't improve it."}
       </p>
+
+      {/* What this run is FOR. Verify = measure only; Optimize = measure, then coach. */}
+      <div style={{ ...card, padding: 16, marginTop: 18 }}>
+        <div style={{ ...label, marginBottom: 10 }}>What should this run do?</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+          {([
+            ['verify', 'Verify only', 'Run every detector, stress battery and metric against this exact prompt, then stop and list the problems it has. No prompt edits.'],
+            ['optimize', 'Optimize', 'Do the same verification first, then let the coach try to fix what it found, iteration by iteration, until the gate or the budget.'],
+          ] as const).map(([k, title, blurb]) => {
+            const on = objective === k
+            return (
+              <button key={k} onClick={() => setObjective(k)}
+                style={{
+                  textAlign: 'left', cursor: 'pointer', padding: 14, borderRadius: 10,
+                  background: on ? T.accentSoft : T.well,
+                  border: `1px solid ${on ? T.accent : T.border2}`,
+                }}>
+                <div style={{ fontSize: 13.5, fontWeight: 650, color: on ? T.text : T.text2, marginBottom: 5 }}>
+                  {on ? '● ' : '○ '}{title}
+                </div>
+                <div style={{ fontSize: 11.5, color: T.faint, lineHeight: 1.55 }}>{blurb}</div>
+              </button>
+            )
+          })}
+        </div>
+      </div>
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 300px', gap: 20, marginTop: 22, alignItems: 'start' }}>
         {/* LEFT — form stack */}
@@ -588,16 +643,70 @@ export function ForgeSetupPage() {
             )}
           </div>
 
+          {/* judge / customer / coach — one model, three roles */}
+          <div style={{ ...card, padding: 18 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10 }}>
+              <span style={label}>Judge, simulated human & coach</span>
+              <div style={{ display: 'flex', borderRadius: 8, overflow: 'hidden', border: `1px solid ${T.border2}` }}>
+                {([[false, 'Gemma (default)'], [true, 'Custom LLM']] as [boolean, string][]).map(([v, lbl]) => (
+                  <button key={lbl} onClick={() => setJudgeCustom(v)}
+                    style={{ padding: '5px 12px', fontSize: 11.5, fontWeight: 600, border: 'none', cursor: 'pointer',
+                             background: judgeCustom === v ? 'var(--accent)' : 'transparent',
+                             color: judgeCustom === v ? '#fff' : T.muted }}>{lbl}</button>
+                ))}
+              </div>
+            </div>
+            <div style={{ fontSize: 12, color: T.faint, lineHeight: 1.6, marginBottom: judgeCustom ? 11 : 0 }}>
+              One model does three jobs here: it <strong style={{ color: T.text3 }}>plays the human</strong> on the other
+              end of every conversation, it <strong style={{ color: T.text3 }}>judges</strong> what happened, and it{' '}
+              <strong style={{ color: T.text3 }}>coaches</strong> the prompt. They move together on purpose — if the lead
+              changed between two runs, the before/after would not compare.
+              {!judgeCustom && (
+                <> Default is{' '}
+                  <span style={{ fontFamily: T.mono, color: T.text3 }}>{prodLlm.model || 'the engine Gemma'}</span>.
+                </>
+              )}
+            </div>
+            {judgeCustom && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <select value={judgeSaved} onChange={(e) => pickJudgeSaved(e.target.value)}
+                  style={{ maxWidth: 300, padding: '8px 10px', borderRadius: 9, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12.5 }}>
+                  <option value="">— type one in, or pick a saved LLM —</option>
+                  {savedLlms.map((l) => <option key={l.id} value={l.id}>{l.name} · {l.model}</option>)}
+                </select>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <input value={judgeCfg.base_url} onChange={(e) => setJudgeCfg({ ...judgeCfg, base_url: e.target.value })}
+                    placeholder="base URL (…/v1)"
+                    style={{ flex: 1, minWidth: 240, padding: '8px 11px', borderRadius: 9, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12.5, fontFamily: T.mono }} />
+                  <input value={judgeCfg.model} onChange={(e) => setJudgeCfg({ ...judgeCfg, model: e.target.value })}
+                    placeholder="model id"
+                    style={{ width: 220, padding: '8px 11px', borderRadius: 9, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12.5, fontFamily: T.mono }} />
+                  <input value={judgeCfg.api_key} onChange={(e) => setJudgeCfg({ ...judgeCfg, api_key: e.target.value })}
+                    type="password" placeholder="API key (optional)"
+                    style={{ width: 150, padding: '8px 11px', borderRadius: 9, border: `1px solid ${T.border2}`, background: T.surface2, color: T.text2, fontSize: 12.5 }} />
+                  <button onClick={testJudge}
+                    style={{ padding: '8px 14px', borderRadius: 9, border: `1px solid ${T.border2}`, background: 'transparent', color: T.muted, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>Test</button>
+                </div>
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                  {judgeTest && <span style={{ fontSize: 12, color: judgeTest.startsWith('✕') ? T.red : T.green }}>{judgeTest}</span>}
+                  <span style={{ fontSize: 11.5, color: T.amber }}>
+                    ⚠ scores from a different judge are not comparable to runs judged by Gemma. Re-verify a baseline on the new judge before you read any before/after.
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+
           {/* scoring config */}
           <div style={{ ...card, padding: 18 }}>
             <div style={{ ...label, marginBottom: 12 }}>Scoring</div>
             <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}>
               <Num label="Tries per problem" value={votes} onChange={setVotes} min={1} max={5}
                 hint="After every prompt edit, each problem's test conversation is run this many times and the majority decides pass/fail. More tries = fewer lucky/unlucky verdicts, slower loop." />
-              <Num label="Max iterations" value={maxIter} onChange={setMaxIter} min={1} max={60}
-                hint="How many prompt-edit attempts the coach gets before handing over to you." />
-              <Num label="Gate %" value={gatePct} onChange={setGatePct} min={50} max={100}
-                hint="The finish line — when this % of problems are solved, the run stops early as LLM-complete." />
+              {!verifyOnly && <Num label="Max iterations" value={maxIter} onChange={setMaxIter} min={1} max={60}
+                hint="How many prompt-edit attempts the coach gets before handing over to you." />}
+              {!verifyOnly && <Num label="Gate %" value={gatePct} onChange={setGatePct} min={50} max={100}
+                hint="The finish line — when this % of problems are solved, the run stops early as LLM-complete." />}
               <Num label="Stress sims" value={stressTarget} onChange={setStressTarget} min={6} max={500}
                 hint="Free-play conversations across your personas in different moods, hunting for problems nobody scripted." />
             </div>
@@ -617,17 +726,19 @@ export function ForgeSetupPage() {
             </div>
             <button onClick={launch} disabled={!ready || launching}
               style={{ ...btnPrimary, width: '100%', marginTop: 18, opacity: !ready || launching ? 0.5 : 1 }}>
-              {launching ? 'Launching…' : 'Launch run →'}
+              {launching ? 'Launching…' : verifyOnly ? 'Verify prompt →' : 'Launch run →'}
             </button>
             {launchError && <div style={{ fontSize: 12, color: T.red, marginTop: 10, lineHeight: 1.5 }}>{launchError}</div>}
             <div style={{ fontSize: 11, color: T.fainter, marginTop: 12, lineHeight: 1.55 }}>
-              v0 runs the identical full pipeline before any coaching, so the human-review before/after is honest.
+              {verifyOnly
+                ? 'One version, one pass: tool checks → problem matrix → deep-confirm → stress → metrics. The prompt you paste is the prompt that gets scored.'
+                : 'v0 runs the identical full pipeline before any coaching, so the human-review before/after is honest.'}
             </div>
           </div>
 
           {/* Standing instructions for the coach. Set here, still editable mid-run on the
               progress page — the engine re-reads it before every proposal. */}
-          <div style={{ ...card, padding: 18, marginTop: 14 }}>
+          <div style={{ ...card, padding: 18, marginTop: 14, display: verifyOnly ? 'none' : undefined }}>
             <div style={label}>Coach guidance</div>
             <div style={{ fontSize: 11.5, color: T.faint, margin: '5px 0 10px', lineHeight: 1.5 }}>
               Anything specific you want the coach to do — style, wording, things to never say.

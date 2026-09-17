@@ -541,6 +541,24 @@ async function createRun(req, res) {
   const lead_status = b.lead_status || 'fresh';
   const vertical = b.vertical || null;
   const scoring = { ...DEFAULT_SCORING, ...(b.scoring || {}) };
+  // 'verify' measures the prompt exactly as supplied and stops at v0 — no coach, no
+  // edits. It is the same measurement an optimize run does first, so the two are
+  // directly comparable; the deliverable is the problem list, not a better prompt.
+  scoring.objective = b.objective === 'verify' ? 'verify' : 'optimize';
+  // Optional judge override (default = env Gemma). ONE knob covers three roles: the
+  // engine hands judge_llm to the grader, to the coach, AND to the simulated human who
+  // drives every conversation (ConversationEngine user_llm) — see ForgeRunner.__init__.
+  // Swapping it swaps all three together, on purpose: a run's verdicts and the lead it
+  // faced must come from the same model, or before/after comparisons stop meaning anything.
+  const judge = b.judge_llm || {};
+  const judgeConfig = {};
+  if (judge.base_url && judge.model) {
+    judgeConfig.judge_base_url = String(judge.base_url).trim();
+    judgeConfig.judge_model = String(judge.model).trim();
+    if (judge.api_key) judgeConfig.judge_api_key = judge.api_key;
+    // Recorded so a result can say WHICH judge produced it. The key is NEVER stored.
+    scoring.judge = { base_url: judgeConfig.judge_base_url, model: judgeConfig.judge_model };
+  }
   const runId = nanoid(12);
 
   let champion;
@@ -641,15 +659,16 @@ async function createRun(req, res) {
   });
 
   const spec = { mode, direction, lead_status, vertical, language: b.language, champion, problems, scoring, dataset,
+    objective: scoring.objective,
     coach_guidance: b.coach_guidance || null,
     combo_resolutions: b.combo_resolutions || null };
   // Optional agent-under-test override (default = the production model / env Gemma).
-  // The judge, customer and coach stay on the fixed judge model regardless.
   const agent = b.agent_llm || {};
   const agentConfig = agent.base_url && agent.model ? {
     llm_base_url: String(agent.base_url).trim(), llm_model: String(agent.model).trim(),
     llm_api_key: agent.api_key || undefined, llm_params: agent.params || undefined,
   } : {};
+  Object.assign(agentConfig, judgeConfig);
   if (toolsSel) {
     agentConfig.enabled_tools = toolsSel;
     agentConfig.tools_enabled = toolsSel.length > 0;
@@ -799,6 +818,9 @@ async function stopRun(req, res) {
   // never move an end time that is already recorded — stopping twice must not restate
   // how long the run took
   if (!run?.completed_at) patch.completed_at = new Date();
+  // A stopped verify run never coached either, so its leftovers are 'found', not
+  // 'the coach ran out of iterations'.
+  const wasVerify = (run?.scoring_json || {}).objective === 'verify';
   if (run && !Object.keys(run.unsolved_json || {}).length) {
     const latest = await ForgeVersion.findOne({
       where: { run_id: run.id, statuses_json: { [Op.ne]: null } }, order: [['version', 'DESC']],
@@ -812,9 +834,10 @@ async function stopRun(req, res) {
       unsolved[pid] = {
         verdict: st.verdict ?? null,
         category: st.verdict === '~' ? (ev.includes('never exercised') ? 'not_exercised' : 'unknown')
-          : st.verdict === 'N' ? 'in_progress' : 'iteration_budget',
+          : st.verdict === 'N' ? (wasVerify ? 'found' : 'in_progress')
+          : wasVerify ? 'found' : 'iteration_budget',
         why: st.verdict
-          ? (ev || 'still failing when the run was stopped')
+          ? (ev || (wasVerify ? 'found in the prompt as written' : 'still failing when the run was stopped'))
           : 'the run was stopped before this problem was reached',
         attempts: 0, evidence: ev.slice(0, 160),
       };
@@ -902,7 +925,7 @@ async function ingestForgeEvent(req, res) {
         greeting: data.greeting || null, composite: data.composite ?? null,
         statuses_json: data.statuses || null,
         section_scores_json: data.section_scores || null, metrics_json: data.metrics || null,
-        latency_json: data.latency || null,
+        latency_json: data.latency || null, stress_json: data.stress || null,
         tool_checks_json: (data.tool_checks || data.tool_fixes)
           ? { ...(data.tool_checks || {}),
               ...(Array.isArray(data.tool_fixes) && data.tool_fixes.length ? { _fixes: data.tool_fixes } : {}) }

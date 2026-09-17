@@ -6,7 +6,7 @@ import type { UnsolvedReason } from '../../stores/forgeStore'
 import { api } from '../../api/client'
 import { ScoreRing, MetricBar, SECTION_LABELS, METRIC_LABELS } from '../../components/analysis'
 import { RunDuration, RunStatusChip, SolvedGauge, VerdictCell, LayerBadge, ProofPanel,
-  ComboScorecard } from '../../components/forge'
+  ComboScorecard, isVerifyRun } from '../../components/forge'
 
 type StatusEntry = { verdict: string | null; passes?: number; votes?: number; evidence?: string; source?: string; sim_uids?: string[]; fails?: { sim_uid: string | null; reason?: string; failing_turn?: number | null }[] }
 
@@ -38,6 +38,7 @@ export function ForgeResultsPage() {
     ([...run.versions].reverse().find((v) => v.statuses_json)?.statuses_json as Record<string, StatusEntry>) || {}
   const denom = run.denominator_snapshot_json?.length ?? null
   const gate = Number(run.scoring_json?.gate_pct ?? 95)
+  const verify = isVerifyRun(run)
   const problemOf = (pid: string) => problems.find((p) => p.id === pid)
   const behaviourOf = (pid: string) => problemOf(pid)?.behaviour || pid
 
@@ -64,7 +65,12 @@ export function ForgeResultsPage() {
         <div>
           <h1 style={{ fontSize: 25, fontWeight: 650, margin: 0, color: T.text }}>{run.name || run.id}</h1>
           <p style={{ fontSize: 13, color: T.muted, margin: '5px 0 0' }}>
-            {run.mode} · {run.dataset_kind} dataset · {run.arena_id ? 'arena run — single pass' : `v${run.current_version}`}
+            {run.mode} · {run.dataset_kind} dataset · {verify ? 'verification — prompt measured as written' : run.arena_id ? 'arena run — single pass' : `v${run.current_version}`}
+            {/* which judge produced these numbers — scores from two judges don't compare */}
+            {(() => {
+              const j = run.scoring_json?.judge as { model?: string } | undefined
+              return j?.model ? <> · judged by <span style={{ fontFamily: T.mono, color: T.text3 }}>{j.model}</span></> : null
+            })()}
             {run.completed_at && <> · <RunDuration createdAt={run.created_at} completedAt={run.completed_at} label="took" /></>}
           </p>
         </div>
@@ -75,10 +81,17 @@ export function ForgeResultsPage() {
           {run.arena_id
             ? <HeaderLink onClick={() => setPromptOpen((v) => !v)}>{promptOpen ? 'Hide prompt' : 'Prompt used'}</HeaderLink>
             : <HeaderLink onClick={() => nav(`/forge/${run.id}/versions`)}>Versions →</HeaderLink>}
-          <button onClick={() => nav(`/forge/${run.id}/review`)}
-            style={{ padding: '9px 16px', borderRadius: 10, border: 'none', background: T.purple, color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
-            Continue to human review →
-          </button>
+          {verify ? (
+            <button onClick={() => { seedSetupFromRun(run); nav('/forge/new') }}
+              style={{ padding: '9px 16px', borderRadius: 10, border: 'none', background: T.accentGrad, color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
+              Optimize this prompt →
+            </button>
+          ) : (
+            <button onClick={() => nav(`/forge/${run.id}/review`)}
+              style={{ padding: '9px 16px', borderRadius: 10, border: 'none', background: T.purple, color: '#fff', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
+              Continue to human review →
+            </button>
+          )}
         </div>
       </div>
 
@@ -113,6 +126,11 @@ export function ForgeResultsPage() {
           <div>
             <div style={label}>The honest read</div>
             <div style={{ fontSize: 13, color: T.text3, marginTop: 6, lineHeight: 1.6, maxWidth: 520 }}>
+              {run.status === 'verified' && (
+                `${Object.keys(run.unsolved_json || {}).length} problem(s) found in this prompt as written. `
+                + 'Nothing was edited — every verdict below is about the prompt you supplied. '
+                + 'Click any row for the conversation that proves it.'
+              )}
               {run.status === 'llm_complete' && `The judge cleared the ${gate}% gate — but Gemma tops out around 85–90. A human pass is still required.`}
               {run.status === 'converged_below_gate' && `The loop plateaued below the ${gate}% gate — the leftovers look like capability ceilings or need your call. Take it to human review.`}
               {run.status === 'awaiting_human' && 'The coach parked questions it can\'t answer alone — answer them in progress, or take over in human review.'}
@@ -272,7 +290,9 @@ export function ForgeResultsPage() {
       )}
 
       {/* WHY THE GAP — a run that stops below the gate accounts for it problem by problem */}
-      <UnsolvedPanel unsolved={run.unsolved_json} behaviourOf={(pid) =>
+      <StressPanel stress={scored?.stress_json ?? [...run.versions].reverse().find((v) => v.stress_json)?.stress_json} />
+
+      <UnsolvedPanel unsolved={run.unsolved_json} verify={verify} behaviourOf={(pid) =>
         problems.find((p) => p.id === pid)?.behaviour || pid} />
 
       {/* THE REPORT CARD — every judged problem, one dense row, click = proof */}
@@ -350,13 +370,87 @@ const CAT_META: Record<string, { label: string; hint: string; color: string }> =
   unknown: { label: 'No usable verdict', hint: 'The judge could not be read on these conversations.', color: T.fainter },
   no_detector: { label: 'No scripted detector', hint: 'Verdict comes only from at-scale stress signals; the coach cannot iterate on it directly.', color: T.fainter },
   in_progress: { label: 'Still failing', hint: 'Attempted but not yet solved when the run ended.', color: T.amber2 },
+  // verify-only runs: no fix was ever attempted, so none of the coach categories apply.
+  found: { label: 'Found in the prompt as written', hint: 'The detector caught this in the prompt you supplied. Nothing was edited — fix it yourself, or run the same prompt again with Optimize.', color: T.red },
 }
-const CAT_ORDER = ['regression', 'refuted', 'in_progress', 'retry_budget', 'iteration_budget',
+const CAT_ORDER = ['found', 'regression', 'refuted', 'in_progress', 'retry_budget', 'iteration_budget',
   'needs_you', 'not_exercised', 'unknown', 'no_detector']
 
-function UnsolvedPanel({ unsolved, behaviourOf }: {
+// The five habits measured in CODE across every agent turn of the stress battery.
+// A verdict says "present at scale"; these say how often, which is what you act on.
+const STRESS_ROWS: { key: string; label: string; suffix: string; warn: (v: number) => boolean; hint: string }[] = [
+  { key: 'pct_digits', label: 'Turns with raw digits or unit abbreviations', suffix: '%', warn: (v) => v > 3,
+    hint: 'TTS reads "1250 sqft" wrong. Spell it: "twelve fifty square feet".' },
+  { key: 'pct_formatting', label: 'Turns with formatting characters', suffix: '%', warn: (v) => v > 3,
+    hint: 'Bullets, asterisks and dashes get spoken aloud or swallowed.' },
+  { key: 'pct_bot_words', label: 'Turns with bot giveaway words', suffix: '%', warn: (v) => v > 5,
+    hint: '"As an AI", "I can assist you with", "certainly!" — a human never says these on a call.' },
+  { key: 'pct_over_2_sentences', label: 'Turns longer than two sentences', suffix: '%', warn: (v) => v > 40,
+    hint: 'On a phone call, a third sentence is where the lead stops listening.' },
+  { key: 'pct_repeat_loops', label: 'Calls where the agent repeated itself verbatim', suffix: '%', warn: (v) => v > 8,
+    hint: 'A verbatim repeat is the signature of a deadlock the agent cannot get out of.' },
+  { key: 'avg_agent_words', label: 'Average words per agent turn', suffix: '', warn: (v) => v > 45,
+    hint: 'Above ~45 words the turn is a monologue, not a conversation.' },
+]
+
+function StressPanel({ stress }: { stress?: Record<string, number> | null }) {
+  if (!stress || typeof stress.n_agent_turns !== 'number') return null
+  return (
+    <>
+      <div style={{ ...label, margin: '26px 0 10px' }}>
+        Habits at scale — measured in code across {stress.n_agent_turns} agent turns from {stress.n_sims} free-play calls
+      </div>
+      <div style={{ ...card, overflow: 'hidden' }}>
+        {STRESS_ROWS.map((r, i) => {
+          const v = stress[r.key]
+          if (typeof v !== 'number') return null
+          const bad = r.warn(v)
+          return (
+            <div key={r.key} style={{
+              display: 'grid', gridTemplateColumns: '1fr 78px', gap: 12, alignItems: 'baseline',
+              padding: '10px 16px', background: i % 2 ? T.well : 'transparent',
+              borderTop: i ? `1px solid ${T.divider}` : undefined,
+            }}>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 13, color: bad ? T.text : T.text3, fontWeight: bad ? 600 : 400 }}>{r.label}</div>
+                {bad && <div style={{ fontSize: 11.5, color: T.faint, marginTop: 3, lineHeight: 1.5 }}>{r.hint}</div>}
+              </div>
+              <div style={{ fontFamily: T.mono, fontSize: 14, fontWeight: 700, textAlign: 'right',
+                            color: bad ? T.red : T.green }}>
+                {v}{r.suffix}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </>
+  )
+}
+
+// "Optimize this prompt" must not mean "go paste it again". Seed the setup form's
+// persisted draft with the exact prompt and dataset this verification ran on, so the
+// optimize run is the same experiment with the coach switched on.
+function seedSetupFromRun(run: { original_prompt_snapshot: unknown; name: string | null; mode: string;
+  direction: string | null; lead_status: string | null; versions: { version: number; merged_markdown: string | null }[] }) {
+  const put = (k: string, v: unknown) => {
+    try { sessionStorage.setItem(`ae:${k}`, JSON.stringify(v)) } catch { /* full/disabled */ }
+  }
+  const snap = run.original_prompt_snapshot as { blob?: unknown } | null
+  const blob = typeof snap?.blob === 'string' && snap.blob.trim()
+    ? snap.blob
+    : (run.versions.find((v) => v.version === 0)?.merged_markdown || '')
+  if (run.mode === 'standalone' && blob) put('forge:standaloneBlob', blob)
+  put('forge:objective', 'optimize')
+  put('forge:mode', run.mode)
+  if (run.direction) put('forge:direction', run.direction)
+  if (run.lead_status) put('forge:leadStatus', run.lead_status)
+  put('forge:name', `${run.name || 'verified prompt'} · optimize`)
+}
+
+function UnsolvedPanel({ unsolved, behaviourOf, verify }: {
   unsolved: Record<string, UnsolvedReason> | null | undefined
   behaviourOf: (pid: string) => string
+  verify?: boolean
 }) {
   const rows = Object.entries(unsolved || {})
   if (rows.length === 0) return null
@@ -368,7 +462,9 @@ function UnsolvedPanel({ unsolved, behaviourOf }: {
   return (
     <>
       <div style={{ ...label, margin: '26px 0 10px' }}>
-        Why {rows.length} problem{rows.length > 1 ? 's are' : ' is'} not solved — grouped by what would fix it
+        {verify
+          ? `${rows.length} problem${rows.length > 1 ? 's' : ''} found — grouped by what it would take to settle each one`
+          : `Why ${rows.length} problem${rows.length > 1 ? 's are' : ' is'} not solved — grouped by what would fix it`}
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
         {cats.map((cat) => {

@@ -82,6 +82,9 @@ export function forgeStatusMeta(status: string): { color: string; label: string 
     case 'human_review': return { color: T.purple, label: 'Human review' }
     case 'finalized': return { color: T.green, label: 'Finalized' }
     case 'converged_below_gate': return { color: T.amber2, label: 'Converged < gate' }
+    // verify-only runs: measurement finished, nothing was optimized. Terminal, and NOT a
+    // grade — a 40%-solved verify run is a successful run with a long problem list.
+    case 'verified': return { color: T.blue, label: 'Verified' }
     case 'stopped': return { color: T.faint, label: 'Stopped' }
     case 'failed': return { color: T.red, label: 'Failed' }
     default: return { color: T.faint, label: status }

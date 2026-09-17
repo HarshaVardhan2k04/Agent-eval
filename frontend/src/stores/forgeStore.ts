@@ -10,6 +10,9 @@ export interface ForgeRunSummary {
   name: string | null
   mode: ForgeMode
   status: string
+  // { objective: 'optimize' | 'verify', votes, gate_pct, ... } — listRuns returns it too,
+  // so a card can say "Verifying" instead of "Optimizing" without a second fetch.
+  scoring_json?: Record<string, number | string>
   dataset_kind: 'real' | 'authored' | null
   vertical: string | null
   direction: string | null
@@ -34,6 +37,9 @@ export interface ForgeVersionRow {
   statuses_json: Record<string, { verdict: Verdict; evidence?: string }> | null
   section_scores_json: Record<string, number | null> | null
   metrics_json: Record<string, number | null> | null
+  // at-scale habit percentages from the stress battery — the numbers behind a
+  // "present at scale" verdict. null = the stress battery did not run.
+  stress_json?: Record<string, number> | null
   tool_checks_json?: Record<string, { verdict: string; called: number; spoken_only: number; not_called: number; n: number }> | null
   edits_json: { op: string; path?: string; text?: string; find?: string; replace?: string }[] | null
   targeted_problem: string | null
@@ -67,7 +73,7 @@ export interface ForgeLayerPin {
 }
 
 export interface ForgeRunDetail extends ForgeRunSummary {
-  scoring_json: Record<string, number>
+  scoring_json: Record<string, number | string>
   dataset_json: Record<string, unknown>
   original_prompt_snapshot: { mode: string; blob?: unknown; layers?: Record<string, unknown> } | null
   denominator_snapshot_json: string[] | null
