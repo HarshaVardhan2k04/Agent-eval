@@ -181,6 +181,21 @@ export const api = {
   ragEvaluate(body: Record<string, unknown>) {
     return request('/api/rag/evaluate', { method: 'POST', body: JSON.stringify(body) })
   },
+  ragBatch(body: Record<string, unknown>) {
+    return request('/api/rag/batches', { method: 'POST', body: JSON.stringify(body) })
+  },
+  listRagBatches() {
+    return request('/api/rag/batches')
+  },
+  getRagBatch(id: string) {
+    return request(`/api/rag/batches/${id}`)
+  },
+  deleteRagBatch(id: string) {
+    return request(`/api/rag/batches/${id}`, { method: 'DELETE' })
+  },
+  ragCallQueries(body: Record<string, unknown>) {
+    return request('/api/rag/call-queries', { method: 'POST', body: JSON.stringify(body) })
+  },
   listRagTests() {
     return request('/api/rag/tests')
   },

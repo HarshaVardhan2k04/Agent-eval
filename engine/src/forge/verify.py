@@ -53,7 +53,9 @@ async def verify_fix(engine, system_prompt, problem, *, greeting="", k=3, strict
         # (10 of 31 problems have exactly one), so re-running them here would re-test what
         # the fix was written against. A paraphrase keeps the SITUATION and changes the
         # WORDS, which is what separates "solved the behaviour" from "matched the script".
-        held = await detectors.heldout_scenario(engine.llm, pid, seed=1000 + i)
+        # Authoring the paraphrased situation must NOT run on the model under test:
+        # the prompt would be graded on wording its own model chose. Use the judge.
+        held = await detectors.heldout_scenario(second_model_llm or engine.llm, pid, seed=1000 + i)
         if held is None:     # no scripted scenario for this pid — generic adversarial probe
             lines, tools_on = _GENERIC_LINES, False
         else:

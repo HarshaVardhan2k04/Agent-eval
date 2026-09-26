@@ -19,6 +19,7 @@ const AppSetting = require('./AppSetting')(sequelize, DataTypes);
 
 // RAG Testing
 const RagTest = require('./RagTest')(sequelize, DataTypes);
+const RagBatch = require('./RagBatch')(sequelize, DataTypes);
 
 // Forge (PromptForge optimizer — replaces old Prompt Eval). Consolidated house-style
 // schema: run (parent w/ JSONB sub-entities) + versions + global problem catalog + events.
@@ -48,6 +49,9 @@ ForgeVersion.belongsTo(ForgeRun, { foreignKey: 'run_id' });
 ForgeRun.hasMany(ForgeEvent, { foreignKey: 'run_id', onDelete: 'CASCADE' });
 ForgeEvent.belongsTo(ForgeRun, { foreignKey: 'run_id' });
 
+RagBatch.hasMany(RagTest, { foreignKey: 'batch_id', as: 'queries', onDelete: 'CASCADE' });
+RagTest.belongsTo(RagBatch, { foreignKey: 'batch_id', as: 'batch' });
+
 module.exports = {
   sequelize,
   SttBatch,
@@ -57,6 +61,7 @@ module.exports = {
   Flow,
   AppSetting,
   RagTest,
+  RagBatch,
   ForgeRun,
   ForgeProblem,
   ForgeVersion,

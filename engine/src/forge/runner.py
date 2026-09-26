@@ -150,24 +150,83 @@ class ForgeRunner:
             api_key=config.get("llm_api_key"),
             params=config.get("llm_params"),
         )
+        # JUDGE model = grading ONLY. It never speaks in a conversation and is never
+        # the prompt under test: it reads FINISHED transcripts and rules on whether a
+        # problem occurred, with a reason. Keeping it to that one job is what lets it
+        # be a different (slower, more careful, metered) model from the two that do the
+        # talking — it is ~200 calls a run, while the talkers are ~450.
         self.judge_llm = LLMClient(
             base_url=config.get("judge_base_url"),
             model=config.get("judge_model"),
             api_key=config.get("judge_api_key"),
+            # Third-party routers (OpenRouter) serve one model id from many providers
+            # whose quantisation, context window and tool support differ — an unpinned
+            # model is a different judge run to run. judge_params carries the routing
+            # controls ({"provider": {"order": [...], "allow_fallbacks": false}});
+            # LLMClient merges anything that is not max_tokens/temperature into the
+            # request body, which is exactly where OpenRouter expects them.
+            params=config.get("judge_params"),
         )
-        self.llm = self.judge_llm  # coach/mining/aux calls run on the fixed judge
+        # HUMAN model = plays the lead on the other end of every simulated call. A
+        # SEPARATE role from the judge on purpose: the grader and the person being
+        # graded against must not be the same thing, and the lead should stay cheap and
+        # fixed (local Gemma) while the judge can be swapped. Defaults to env Gemma,
+        # NOT to the judge, so pointing the judge at a metered provider does not
+        # silently bill every conversational turn too.
+        self.user_llm = LLMClient(
+            base_url=config.get("human_base_url"),
+            model=config.get("human_model"),
+            api_key=config.get("human_api_key"),
+            params=config.get("human_params"),
+        )
+        # COACH model = authors prompt edits (optimize runs only; never used by a
+        # verification). Reasoning work like the judge, so it follows the judge unless
+        # given its own endpoint.
+        self.coach_llm = LLMClient(
+            base_url=config.get("coach_base_url") or config.get("judge_base_url"),
+            model=config.get("coach_model") or config.get("judge_model"),
+            api_key=config.get("coach_api_key") or config.get("judge_api_key"),
+            params=config.get("coach_params") or config.get("judge_params"),
+        )
+        self.llm = self.coach_llm  # mining/aux authoring calls
         # Core four (end_call, voicemail_detected, handle_call_screening,
         # date_calculator) are always on inside ToolSimulator — this list is the
         # GATED extras, mirroring production's available_tools metadata.
         tools = ToolSimulator(config.get("enabled_tools") or [
             "warm_transfer_call", "search_knowledge_base", "send_whatsapp_template",
         ]) if config.get("tools_enabled", True) else None
-        self.engine = ConversationEngine(self.agent_llm, tools, None, user_llm=self.judge_llm)
-        self.evaluator = CallEvaluator(self.judge_llm)
-        self.coach = Coach(self.judge_llm)
+        self.engine = ConversationEngine(self.agent_llm, tools, None, user_llm=self.user_llm)
+        self.evaluator = CallEvaluator(self.judge_llm)   # grading — judge's job
+        self.coach = Coach(self.coach_llm)
 
     def stop(self):
         self._stopped = True
+
+    def _token_report(self):
+        """What this run actually spent, one entry per ROLE.
+
+        Four distinct jobs, four tallies, because they are priced separately and can
+        run on different models: `agent` is the prompt under test, `human` plays the
+        lead, `judge` reads finished transcripts and rules on problems, `coach` writes
+        edits (optimize runs only — a verification spends nothing here)."""
+        def _one(c):
+            u = dict(getattr(c, "usage", None) or {})
+            u["total_tokens"] = u.get("prompt_tokens", 0) + u.get("completion_tokens", 0)
+            u["model"] = c.model
+            return u
+        out = {"agent": _one(self.agent_llm), "human": _one(self.user_llm),
+               "judge": _one(self.judge_llm), "coach": _one(self.coach_llm)}
+        # A role sharing an endpoint with another shares its LLMClient, so its tally
+        # would double-count. Say so rather than reporting the same tokens twice.
+        seen = {}
+        for role, c in (("agent", self.agent_llm), ("human", self.user_llm),
+                        ("judge", self.judge_llm), ("coach", self.coach_llm)):
+            key = id(c)
+            if key in seen:
+                out[role] = {"shares_client_with": seen[key], "model": c.model}
+            else:
+                seen[key] = role
+        return out
 
     async def _run_tool_checks(self, system_prompt, greeting, only=None):
         """One scripted conversation per enabled tool (x2 phrasings): does the model
@@ -1233,6 +1292,7 @@ class ForgeRunner:
             await self.bus.emit("run_complete", {
                 "run_id": self.run_id, "status": "verified", "solved_pct": solved_pct,
                 "final_version": 0, "parked": [], "unsolved": unsolved,
+                "tokens": self._token_report(),
                 "champion": (champion.get("layers") if mode == "layered" else {"blob": champion.get("blob")}),
             })
             return {"status": "verified", "solved_pct": solved_pct, "version": 0,
@@ -1429,9 +1489,14 @@ class ForgeRunner:
                         accept = False
                 if accept:
                     vid = deep_ys[0]
+                    # The skeptic is GRADING, so it runs on the judge — not on
+                    # engine.llm, which is the model under test. verify_fix falls back
+                    # to the agent when this is omitted, i.e. the prompt's own model
+                    # deciding whether the fix to it holds.
                     verify_res = await fverify.verify_fix(
                         self.engine, csp, {"id": vid, "behaviour": problem_defs[vid].get("behaviour", "")},
-                        greeting=cgreet, k=int(scoring.get("verify_k", 3)))
+                        greeting=cgreet, k=int(scoring.get("verify_k", 3)),
+                        second_model_llm=self.judge_llm)
                     if not verify_res.get("holds"):
                         accept = False
 
@@ -1515,6 +1580,7 @@ class ForgeRunner:
         await self.bus.emit("run_complete", {
             "run_id": self.run_id, "status": final_status, "solved_pct": solved_pct,
             "final_version": version, "parked": list(parked),
+            "tokens": self._token_report(),
             # Every problem that is not solved says WHY. A run that stops short must
             # account for the gap problem by problem, not just report a percentage.
             "unsolved": unsolved,

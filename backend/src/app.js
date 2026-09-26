@@ -9,6 +9,7 @@ const flowRouter = require('./routes/flow');
 const settingsRouter = require('./routes/settings');
 const ragRouter = require('./routes/rag');
 const forgeRouter = require('./routes/forge');
+const publicVerifyRouter = require('./routes/publicVerify');
 const forgeController = require('./controllers/forgeController');
 
 const app = express();
@@ -24,6 +25,9 @@ app.use('/api/flow', flowRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/rag', ragRouter);
 app.use('/api/forge', forgeRouter);
+// Public, key-authenticated verification API for other systems. Mounted last and
+// under its own /api/v1 prefix so it never shadows an internal route.
+app.use('/api/v1', publicVerifyRouter);
 app.post('/api/internal/forge-events', forgeController.ingestForgeEvent); // engine progress callback
 // engine re-reads the operator's live coach guidance before each proposal
 app.get('/api/internal/forge/:id/coach-guidance', forgeController.getCoachGuidance);

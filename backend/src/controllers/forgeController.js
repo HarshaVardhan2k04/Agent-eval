@@ -1014,6 +1014,8 @@ async function ingestForgeEvent(req, res) {
       if (data.solved_pct != null) patch.solved_pct = data.solved_pct;
       // why each remaining problem is unsolved — the run's account of its own gap
       if (data.unsolved && typeof data.unsolved === 'object') patch.unsolved_json = data.unsolved;
+      // what the run spent, split judge vs agent under test
+      if (data.tokens && typeof data.tokens === 'object') patch.tokens_json = data.tokens;
       if (data.error) patch.error_message = String(data.error).slice(0, 1000); // the card shows this
       await ForgeRun.update(patch, { where: { id: runId } });
 
@@ -1330,6 +1332,9 @@ async function exportRun(req, res) {
 }
 
 module.exports = {
+  // shared with the public /api/v1 controller so problem ordering + applicability
+  // filtering can never drift between the in-product runs and the API's
+  PROBLEM_ORDER, applies,
   listSavedPrompts, getSavedPrompt, createSavedPrompt, updateSavedPrompt, deleteSavedPrompt,
   linkSavedPrompt, unlinkSavedPrompt,
   getCoachGuidance,

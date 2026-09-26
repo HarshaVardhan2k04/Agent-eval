@@ -7,6 +7,14 @@ const router = Router();
 router.get('/default-url', c.defaultUrl);
 router.get('/collections', c.getCollections);
 router.post('/evaluate', validateRequest(schemas.ragEvaluate), c.evaluate);
+router.post('/batches', c.evaluateBatch);
+router.get('/batches', c.listBatches);
+router.get('/batches/:id', c.getBatch);
+router.delete('/batches/:id', c.deleteBatch);
+router.post('/call-queries', c.callQueries);
+// one-shot: "check this call's RAG relevancy"
+router.post('/call-report', c.startCallReport);
+router.get('/call-report/:id', c.getCallReport);
 router.get('/tests', c.listTests);
 router.get('/tests/:id', c.getTest);
 router.delete('/tests/:id', c.deleteTest);

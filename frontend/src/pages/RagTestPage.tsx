@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { T, card, btnPrimary, label } from '../theme'
+import { T, card, btnPrimary, btnSecondary, label } from '../theme'
 import { api } from '../api/client'
 import { score100Color } from '../components/analysis'
 import { usePersisted } from '../usePersisted'
@@ -126,6 +126,73 @@ export function RagTestPage() {
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = usePersisted<RagTest | null>('rag:result', null)
   const [history, setHistory] = useState<RagTest[]>([])
+  // ---- batch / call-mining ----
+  type Mined = { query: string; said: string; kind: string }
+  type BatchRow = { id: string; query: string; answer: string | null; gold_answer: string | null
+                    metrics_json: Record<string, { score?: number; score_100?: number; reason?: string }
+                      & { _no_context?: boolean; _error?: string }> }
+  type Batch = { id: string; name: string | null; collection: string; status: string; source: string
+                 source_meta: Record<string, unknown>; n_queries: number; n_done: number
+                 created_at?: string
+                 aggregate_json: { overall_100?: number | null; n_scored?: number; no_context?: number
+                   per_metric?: Record<string, { score_100: number; n: number; weak: number
+                     worst?: { id: string; query: string; score: number }[] }> }
+                 queries?: BatchRow[] }
+  const [mode, setMode] = usePersisted<'single' | 'batch' | 'call'>('rag:mode', 'single')
+  const [batchText, setBatchText] = usePersisted('rag:batchText', '')
+  const [vertical, setVertical] = usePersisted('rag:vertical', '')
+  const [verticals, setVerticals] = useState<{ key: string; label: string; dbConfigured: boolean }[]>([])
+  const [callId, setCallId] = usePersisted('rag:callId', '')
+  const [mining, setMining] = useState(false)
+  const [mined, setMined] = usePersisted<Mined[] | null>('rag:mined', null)
+  const [minedMeta, setMinedMeta] = usePersisted<Record<string, unknown> | null>('rag:minedMeta', null)
+  const [picked, setPicked] = usePersisted<string[]>('rag:picked', [])
+  const [batch, setBatch] = usePersisted<Batch | null>('rag:batch', null)
+  const [batches, setBatches] = useState<Batch[]>([])   // past batches, listed under history
+
+  useEffect(() => { api.analysisVerticals().then(setVerticals).catch(() => {}) }, [])
+  useEffect(() => { api.listRagBatches().then(setBatches).catch(() => {}) }, [])
+
+  // poll a live batch until it settles
+  useEffect(() => {
+    if (!batch || batch.status !== 'running') return
+    const t = setInterval(async () => {
+      try {
+        const b = await api.getRagBatch(batch.id) as Batch
+        setBatch(b)
+        if (b.status !== 'running') { clearInterval(t); api.listRagBatches().then(setBatches).catch(() => {}) }
+      } catch { /* keep polling */ }
+    }, 2500)
+    return () => clearInterval(t)
+  }, [batch, setBatch])
+
+  async function mineCall() {
+    setMining(true); setError(null); setMined(null)
+    try {
+      const d = await api.ragCallQueries({ vertical, call_id: callId.trim(), mode: 'llm' }) as
+        { queries: Mined[]; warning?: string | null } & Record<string, unknown>
+      setMined(d.queries || [])
+      setMinedMeta({ n_turns: d.n_turns, n_user_turns: d.n_user_turns, agent_id: d.agent_id,
+                     direction: d.direction, mode: d.mode, warning: d.warning })
+      // pre-select only the knowledge-base questions; call actions stay off by default
+      setPicked((d.queries || []).filter((q) => q.kind === 'kb_question').map((q) => q.query))
+    } catch (e) { setError((e as Error).message || 'could not read that call') }
+    setMining(false)
+  }
+
+  async function runBatch(queries: string[], source: string, source_meta: Record<string, unknown>) {
+    if (!queries.length) return
+    setBusy(true); setError(null)
+    try {
+      const started = await api.ragBatch({
+        name: source === 'call' ? `call ${String(callId).slice(0, 8)}` : null,
+        collection, rag_url: ragUrl, queries, answer_mode: answerMode,
+        search_type: searchType, top_k: topK, alpha, rerank, source, source_meta,
+      }) as { batch_id: string }
+      setBatch(await api.getRagBatch(started.batch_id) as Batch)
+    } catch (e) { setError((e as Error).message || 'batch failed to start') }
+    setBusy(false)
+  }
 
   const connect = async (url: string) => {
     if (!/^https?:\/\/.+/i.test(url)) { setConnErr('Enter a valid http(s) URL'); return }
@@ -248,9 +315,112 @@ export function RagTestPage() {
         </div>
 
         <div style={{ marginTop: 16 }}>
-          <div style={{ ...label, marginBottom: 7 }}>Question</div>
-          <textarea value={query} onChange={(e) => setQuery(e.target.value)} rows={2} placeholder="e.g. what health insurance plans do you offer?"
-            style={{ ...inputStyle, resize: 'vertical', lineHeight: 1.5 }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 9, flexWrap: 'wrap' }}>
+            <div style={label}>Questions</div>
+            <div style={{ display: 'flex', borderRadius: 9, overflow: 'hidden', border: `1px solid ${T.border}` }}>
+              {([['single', 'One question'], ['batch', 'Several questions'],
+                 ['call', 'From a real call']] as [typeof mode, string][]).map(([v, lbl]) => (
+                <button key={v} onClick={() => setMode(v)}
+                  style={{ padding: '6px 13px', fontSize: 12.5, fontWeight: 600, border: 'none', cursor: 'pointer',
+                           background: mode === v ? 'var(--accent)' : 'transparent',
+                           color: mode === v ? '#fff' : T.muted }}>{lbl}</button>
+              ))}
+            </div>
+          </div>
+
+          {mode === 'single' && (
+            <textarea value={query} onChange={(e) => setQuery(e.target.value)} rows={2}
+              placeholder="e.g. what health insurance plans do you offer?"
+              style={{ ...inputStyle, resize: 'vertical', lineHeight: 1.5 }} />
+          )}
+
+          {mode === 'batch' && (
+            <>
+              <textarea value={batchText} onChange={(e) => setBatchText(e.target.value)} rows={6}
+                placeholder={'one question per line —\nwhat health insurance plans do you offer?\nwhat is the waiting period for pre-existing conditions?\nhow do I claim reimbursement?'}
+                style={{ ...inputStyle, resize: 'vertical', lineHeight: 1.6, fontFamily: T.mono, fontSize: 12.5 }} />
+              <div style={{ fontSize: 11.5, color: T.faint, marginTop: 6 }}>
+                {batchText.split('\n').filter((l) => l.trim()).length} questions · each is retrieved,
+                answered and scored on its own, then combined into one read
+              </div>
+            </>
+          )}
+
+          {mode === 'call' && (
+            <div>
+              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+                <div style={{ width: 170 }}>
+                  <div style={{ ...label, marginBottom: 7 }}>Vertical</div>
+                  <select value={vertical} onChange={(e) => setVertical(e.target.value)} style={inputStyle}>
+                    <option value="">— pick —</option>
+                    {verticals.filter((v) => v.dbConfigured).map((v) => (
+                      <option key={v.key} value={v.key}>{v.label}</option>))}
+                  </select>
+                </div>
+                <div style={{ flex: 1, minWidth: 240 }}>
+                  <div style={{ ...label, marginBottom: 7 }}>Call ID</div>
+                  <input value={callId} onChange={(e) => setCallId(e.target.value)} spellCheck={false}
+                    placeholder="4848a532-8421-4d3f-a627-2d48a927e7c3"
+                    style={{ ...inputStyle, fontFamily: T.mono, fontSize: 12.5 }} />
+                </div>
+                <button onClick={mineCall} disabled={!vertical || !callId.trim() || mining}
+                  style={{ ...btnPrimary, opacity: (!vertical || !callId.trim() || mining) ? 0.5 : 1 }}>
+                  {mining ? 'Reading call…' : 'Find the questions'}
+                </button>
+              </div>
+              <div style={{ fontSize: 11.5, color: T.faint, marginTop: 7 }}>
+                Reads the transcript read-only and pulls out what the customer actually asked.
+                Production takes the collection from per-call dispatch metadata, which the calls
+                table doesn't store — so pick the collection above yourself.
+              </div>
+
+              {mined && (
+                <div style={{ marginTop: 14, border: `1px solid ${T.border}`, borderRadius: 10, overflow: 'hidden' }}>
+                  <div style={{ padding: '9px 13px', borderBottom: `1px solid ${T.divider}`, display: 'flex',
+                                gap: 10, alignItems: 'center', flexWrap: 'wrap', background: T.well }}>
+                    <span style={{ fontSize: 12.5, color: T.text2, fontWeight: 600 }}>
+                      {mined.length} found · {picked.length} selected
+                    </span>
+                    <span style={{ fontSize: 11.5, color: T.faint }}>
+                      {String((minedMeta || {}).n_user_turns ?? '?')} customer turns ·
+                      agent {String((minedMeta || {}).agent_id ?? '?')}
+                    </span>
+                    <button onClick={() => setPicked(mined.filter((q) => q.kind === 'kb_question').map((q) => q.query))}
+                      style={{ ...btnSecondary, marginLeft: 'auto', fontSize: 11.5, padding: '4px 10px' }}>
+                      only KB questions
+                    </button>
+                  </div>
+                  {mined.map((q) => {
+                    const on = picked.includes(q.query)
+                    const isAction = q.kind === 'call_action'
+                    return (
+                      <div key={q.query} onClick={() => setPicked(on ? picked.filter((x) => x !== q.query) : [...picked, q.query])}
+                        style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '8px 13px',
+                                 borderTop: `1px solid ${T.divider}`, cursor: 'pointer',
+                                 background: on ? 'rgba(var(--accent-rgb),0.07)' : 'transparent' }}>
+                        <input type="checkbox" checked={on} readOnly style={{ accentColor: 'var(--accent)', marginTop: 3 }} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <div style={{ fontSize: 13, color: T.text2 }}>{q.query}</div>
+                          {q.said && q.said !== q.query && (
+                            <div style={{ fontSize: 11, color: T.fainter, marginTop: 2, fontStyle: 'italic' }}>said: “{q.said}”</div>
+                          )}
+                        </div>
+                        <span title={isAction
+                            ? 'a request about the call itself — no knowledge base can answer it, so scoring it would punish retrieval unfairly'
+                            : 'a document could answer this'}
+                          style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.04em', padding: '2px 7px',
+                                   borderRadius: 99, whiteSpace: 'nowrap',
+                                   background: isAction ? T.amber + '22' : T.green + '18',
+                                   color: isAction ? T.amber2 : T.green }}>
+                          {isAction ? 'CALL ACTION' : 'KB'}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         <div style={{ marginTop: 16, display: 'flex', gap: 16, flexWrap: 'wrap' }}>
@@ -287,14 +457,132 @@ export function RagTestPage() {
           {answerMode === 'none' && !gold.trim() ? ' add an answer and/or a gold answer to unlock the other 4.' : ''}
         </div>
 
-        <button onClick={run} disabled={!collection || !query.trim() || busy || !collections.length}
-          style={{ ...btnPrimary, marginTop: 12, opacity: (!collection || !query.trim() || busy || !collections.length) ? 0.5 : 1 }}>
-          {busy ? 'Retrieving & scoring…' : 'Run RAG eval'}
-        </button>
+        {(() => {
+          const lines = batchText.split('\n').map((l) => l.trim()).filter(Boolean)
+          const n = mode === 'single' ? (query.trim() ? 1 : 0) : mode === 'batch' ? lines.length : picked.length
+          const blocked = !collection || !collections.length || busy || n === 0
+          const go = () => {
+            if (mode === 'single') return run()
+            if (mode === 'batch') return runBatch(lines, 'manual', {})
+            return runBatch(picked, 'call', { vertical, call_id: callId.trim(),
+              agent_id: (minedMeta || {}).agent_id ?? null, n_candidates: (mined || []).length })
+          }
+          return (
+            <button onClick={go} disabled={blocked}
+              style={{ ...btnPrimary, marginTop: 12, opacity: blocked ? 0.5 : 1 }}>
+              {busy ? 'Retrieving & scoring…'
+                : mode === 'single' ? 'Run RAG eval'
+                : `Run ${n} question${n === 1 ? '' : 's'}`}
+            </button>
+          )
+        })()}
       </div>
 
+      {/* Past batches — reopen one without re-running it */}
+      {!batch && batches.length > 0 && (
+        <div style={{ marginTop: 24 }}>
+          <div style={{ ...label, marginBottom: 10 }}>Past batches</div>
+          <div style={{ ...card, padding: 0, overflow: 'hidden' }}>
+            {batches.slice(0, 8).map((b, i) => (
+              <div key={b.id} onClick={async () => setBatch(await api.getRagBatch(b.id) as Batch)}
+                style={{ display: 'flex', gap: 12, alignItems: 'center', padding: '9px 14px', cursor: 'pointer',
+                         borderTop: i ? `1px solid ${T.divider}` : 'none', background: i % 2 ? T.well : 'transparent' }}>
+                <span style={{ fontFamily: T.mono, fontSize: 13, fontWeight: 700,
+                               color: score100Color(b.aggregate_json?.overall_100 ?? null), width: 34 }}>
+                  {b.aggregate_json?.overall_100 ?? '—'}
+                </span>
+                <span style={{ fontSize: 12.5, color: T.text2 }}>{b.name || `${b.n_queries} questions`}</span>
+                <span style={{ fontSize: 11.5, color: T.fainter }}>{b.collection}</span>
+                {b.source === 'call' && <span style={{ fontSize: 10.5, color: T.blue }}>from call</span>}
+                <span style={{ marginLeft: 'auto', fontSize: 11, color: T.fainter }}>
+                  {b.status === 'running' ? `${b.n_done}/${b.n_queries}` : new Date(b.created_at as unknown as string).toLocaleDateString()}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Batch results — per-question scores plus the combined read */}
+      {batch && (
+        <div style={{ marginTop: 24 }}>
+          <div style={{ ...label, marginBottom: 12, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+            <span>Batch · {batch.collection}</span>
+            <span style={{ fontSize: 11.5, color: batch.status === 'complete' ? T.green : batch.status === 'failed' ? T.red : T.blue }}>
+              {batch.status === 'running' ? `running ${batch.n_done}/${batch.n_queries}` : batch.status}
+            </span>
+            {batch.source === 'call' && (
+              <span style={{ fontSize: 11.5, color: T.fainter, fontFamily: T.mono }}>
+                from call {String((batch.source_meta || {}).call_id || '').slice(0, 8)}
+              </span>
+            )}
+            <button onClick={() => setBatch(null)} style={{ ...btnSecondary, marginLeft: 'auto', fontSize: 11.5, padding: '4px 10px' }}>close</button>
+          </div>
+
+          {/* combined */}
+          <div style={{ ...card, padding: 18 }}>
+            <div style={{ display: 'flex', gap: 22, flexWrap: 'wrap', alignItems: 'center' }}>
+              <div>
+                <div style={{ fontSize: 30, fontWeight: 700, fontFamily: T.mono,
+                              color: score100Color(batch.aggregate_json?.overall_100 ?? null) }}>
+                  {batch.aggregate_json?.overall_100 ?? '—'}
+                </div>
+                <div style={{ fontSize: 11, color: T.faint, textTransform: 'uppercase', letterSpacing: '.05em' }}>combined</div>
+              </div>
+              <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap' }}>
+                {Object.entries(batch.aggregate_json?.per_metric || {}).map(([k, m]) => (
+                  <div key={k}>
+                    <div style={{ fontSize: 18, fontWeight: 650, fontFamily: T.mono, color: score100Color(m.score_100) }}>
+                      {m.score_100}
+                    </div>
+                    <div style={{ fontSize: 11, color: T.muted }}>{k.replace(/_/g, ' ')}</div>
+                    <div style={{ fontSize: 10.5, color: m.weak ? T.amber2 : T.fainter }}>
+                      n={m.n}{m.weak ? ` · ${m.weak} weak` : ''}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {!!batch.aggregate_json?.no_context && (
+                <div style={{ marginLeft: 'auto', fontSize: 12, color: T.amber2 }}>
+                  {batch.aggregate_json.no_context} question{batch.aggregate_json.no_context === 1 ? '' : 's'} retrieved nothing
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* per question */}
+          <div style={{ ...card, marginTop: 12, padding: 0, overflow: 'hidden' }}>
+            {(batch.queries || []).map((q, i) => {
+              const m = q.metrics_json || {}
+              const failed = m._no_context || m._error
+              return (
+                <div key={q.id} style={{ padding: '10px 14px', borderTop: i ? `1px solid ${T.divider}` : 'none',
+                                         background: i % 2 ? T.well : 'transparent' }}>
+                  <div style={{ display: 'flex', gap: 12, alignItems: 'baseline', flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 13, color: T.text2, flex: 1, minWidth: 200 }}>{q.query}</span>
+                    {failed ? (
+                      <span style={{ fontSize: 11.5, color: T.amber2 }}>
+                        {m._no_context ? 'no chunks retrieved' : String(m._error).slice(0, 60)}
+                      </span>
+                    ) : Object.entries(m).filter(([k]) => !k.startsWith('_')).map(([k, v]) => (
+                      <span key={k} title={k.replace(/_/g, ' ') + (v.reason ? ` — ${v.reason}` : '')}
+                        style={{ fontSize: 11.5, fontFamily: T.mono, color: score100Color(v.score_100 ?? null) }}>
+                        {k.split('_').map((w) => w[0]).join('').toUpperCase()} {v.score_100 ?? '—'}
+                      </span>
+                    ))}
+                  </div>
+                  {q.answer && (
+                    <div style={{ fontSize: 11.5, color: T.faint, marginTop: 4, lineHeight: 1.5 }}>{q.answer}</div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Results */}
-      {result && (
+      {result && mode === 'single' && (
         <div style={{ marginTop: 24 }}>
           <div style={{ ...label, marginBottom: 12 }}>
             Metrics · {ranCount} of 5 ran · {result.collection} · {String(result.search_params.search_type)}

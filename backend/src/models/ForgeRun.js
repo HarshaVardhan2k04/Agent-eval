@@ -28,6 +28,9 @@ module.exports = (sequelize, DataTypes) =>
       combos_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
       // per-problem reason a run finished below the gate (see the migration)
       unsolved_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+      // per-role token spend for the run (see the migration) — the judge half is what
+      // a hosted verification costs us
+      tokens_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
       // operator's live instructions to the coach, per run, editable mid-run
       coach_guidance: { type: DataTypes.TEXT, allowNull: true },
       final_composite: { type: DataTypes.REAL, allowNull: true },

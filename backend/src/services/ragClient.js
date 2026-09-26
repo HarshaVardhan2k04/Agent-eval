@@ -58,4 +58,16 @@ async function ragSuite(body) {
   return res.json();
 }
 
-module.exports = { collections, search, generateAnswer, ragSuite };
+// Mine a production transcript for customer questions worth asking the KB.
+async function extractQueries(transcript, mode = 'llm') {
+  const res = await fetch(`${engineUrl}/api/analysis/extract-rag-queries`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transcript, mode, max_queries: 200 }),
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!res.ok) throw new Error(`Engine extract-rag-queries: ${res.status}`);
+  return res.json();
+}
+
+module.exports = { collections, search, generateAnswer, ragSuite, extractQueries };

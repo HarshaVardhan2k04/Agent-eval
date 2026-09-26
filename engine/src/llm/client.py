@@ -81,6 +81,13 @@ class LLMClient:
         # replace the call's values; anything else (reasoning, top_p, ...) is merged
         # into the request body — how OpenRouter takes reasoning/thinking controls.
         self.params = dict(params or {})
+        # Running token tally for THIS client. The judge and the agent are separate
+        # LLMClient instances, so this separates "what the judge cost" from "what the
+        # model under test cost" — they are usually different models at different
+        # prices, and only the judge's half is ours to pay on a hosted API.
+        # prompt_tokens matters as much as completion: a judge reads whole transcripts,
+        # so its input dwarfs its output even though output is priced higher.
+        self.usage = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "untracked_calls": 0}
         # Fail fast, never freeze a run: a single stuck completion used to block for
         # up to ~30 min (SDK default 600s x retries). 2 min read cap + 1 retry.
         import httpx as _httpx
@@ -191,6 +198,14 @@ class LLMClient:
                 finish_reason=finish_reason,
             )
             ctok = getattr(usage, "completion_tokens", None) if usage else None
+            ptok = getattr(usage, "prompt_tokens", None) if usage else None
+            self.usage["calls"] += 1
+            if ctok is None and ptok is None:
+                # Some providers omit the usage chunk when streaming. Count the call so
+                # a total is never quietly reported as complete when it is not.
+                self.usage["untracked_calls"] += 1
+            self.usage["prompt_tokens"] += int(ptok or 0)
+            self.usage["completion_tokens"] += int(ctok or 0)
             msg.latency_ms = _ms
             msg.ttft_ms = ttft
             msg.completion_tokens = ctok

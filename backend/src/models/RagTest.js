@@ -17,6 +17,11 @@ module.exports = (sequelize, DataTypes) =>
       retrieval_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
       // { contextual_relevancy:{...}, faithfulness:{...}, answer_relevancy:{...}, ... }
       metrics_json: { type: DataTypes.JSONB, allowNull: false, defaultValue: {} },
+      // what this turn WAS, when mined from a call: kb_question | call_action | chit_chat.
+      // Production searches on every turn, so the kind is what makes the score readable.
+      kind: { type: DataTypes.TEXT, allowNull: true },
+      // null = a standalone single-query run; set = a member of that batch
+      batch_id: { type: DataTypes.TEXT, allowNull: true },
       created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: DataTypes.NOW },
     },
     {
